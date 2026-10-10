@@ -1,0 +1,97 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "tarpc",
+  "projectDescription": "An async RPC framework for Rust that lets you define services as traits, generates client and server boilerplate, and supports pluggable transports with built-in cancellation, deadlines, and distributed tracing.",
+  "theme": "luma",
+  "primaryColor": "#5c64f4",
+  "lightColor": "#acb4fc",
+  "darkColor": "#ffffff",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/service-macro",
+              "concepts/client",
+              "concepts/server",
+              "concepts/context-and-deadlines",
+              "concepts/transport"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/tcp-transport",
+              "guides/tls",
+              "guides/request-hooks",
+              "guides/load-balancing-and-retries",
+              "guides/distributed-tracing",
+              "guides/custom-transport"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/cargo-features",
+              "reference/configuration",
+              "reference/error-types",
+              "reference/changelog"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Schema-in-code: define RPC services as Rust traits using the #[tarpc::service] attribute macro",
+    "Pluggable transport: any Stream + Sink implementation can serve as a transport",
+    "Cascading cancellation: dropping a request future sends cancellation to the server and propagates through dependencies",
+    "Configurable deadlines with automatic propagation across service chains",
+    "Distributed tracing via tracing + OpenTelemetry integration",
+    "Optional Serde serialization (serde1 feature) with JSON and Bincode formats",
+    "Server-side request hooks (before/after/before_and_after) for cross-cutting concerns",
+    "Client stubs with load balancing (RoundRobin, ConsistentHash) and retry support",
+    "Limit helpers: max_channels_per_key, max_concurrent_requests_per_channel",
+    "In-process channel transport for zero-serialization testing"
+  ],
+  "publicApiSurface": [
+    "#[tarpc::service] — attribute macro that generates service trait, client stub, and request/response types",
+    "tarpc::client::Config — client configuration (max_in_flight_requests, pending_request_buffer)",
+    "tarpc::client::Channel<Req, Resp> — multiplexed client channel",
+    "tarpc::client::NewClient<C, D> — client + dispatch pair returned by client::new()",
+    "tarpc::client::stub::Stub — trait for types that can call remote services",
+    "tarpc::client::stub::load_balance::RoundRobin — round-robin load-balancing stub",
+    "tarpc::client::stub::load_balance::ConsistentHash — consistent-hash load-balancing stub",
+    "tarpc::client::stub::retry::Retry — retry stub",
+    "tarpc::server::Config — server channel configuration (pending_response_buffer)",
+    "tarpc::server::BaseChannel — standard server channel implementation",
+    "tarpc::server::Channel — trait for server channels",
+    "tarpc::server::Serve — trait for request handlers",
+    "tarpc::server::serve() — wraps a closure into a Serve impl",
+    "tarpc::server::incoming::Incoming — extension trait for streams of channels",
+    "tarpc::server::incoming::spawn_incoming() — spawns all channels via Tokio",
+    "tarpc::server::request_hook::RequestHook — extension trait with .before() / .after() / .before_and_after()",
+    "tarpc::server::limits — max_channels_per_key and max_concurrent_requests_per_channel",
+    "tarpc::context::Context — request-scoped deadline and trace context",
+    "tarpc::context::current() — returns the current request context",
+    "tarpc::transport::channel::unbounded() — creates an in-process unbounded channel transport",
+    "tarpc::serde_transport — Serde-based transport over AsyncRead+AsyncWrite streams",
+    "tarpc::serde_transport::tcp — TCP connect/listen helpers",
+    "tarpc::serde_transport::unix — Unix domain socket connect/listen helpers",
+    "tarpc::Transport — sealed bidirectional Stream+Sink transport trait",
+    "tarpc::ServerError — error type returned by server handlers",
+    "tarpc::ChannelError — critical channel-level errors",
+    "tarpc::Request<T> / tarpc::Response<T> — wire message types"
+  ]
+}

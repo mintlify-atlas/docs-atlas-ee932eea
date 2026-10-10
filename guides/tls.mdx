@@ -1,0 +1,234 @@
+---
+sidebarTitle: "TLS"
+title: "Secure tarpc connections with TLS and tokio-rustls"
+description: "Wrap tarpc's TCP transport with tokio-rustls to encrypt connections using mutual TLS, certificate loading, and Rustls configuration."
+---
+
+tarpc's transport layer is deliberately separated from the serialization layer, which means you can slip TLS in between TCP and the serde codec with just a few extra lines of code. This guide walks through the pattern used in the `tls_over_tcp` example: loading certificates with `rustls-pemfile`, building a `TlsAcceptor` on the server side, a `TlsConnector` on the client side, and wiring both into `serde_transport::new`.
+
+## Dependencies
+
+Add the following to your `Cargo.toml`. No special tarpc features are required beyond those already needed for TCP — TLS is applied at the stream level before tarpc even sees the bytes.
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["serde-transport", "tcp"] }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2.2"
+tokio-serde = { version = "0.9", features = ["bincode"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+anyhow = "1"
+```
+
+<Note>
+The example uses EdDSA certificates generated with OpenSSL 3. The loading helpers below support PKCS#1, PKCS#8, and SEC1 private-key formats automatically.
+</Note>
+
+## Loading certificates and keys
+
+rustls-pemfile provides PEM parsing. These two helpers are taken directly from the `tls_over_tcp` example:
+
+```rust filename="src/tls_utils.rs"
+use rustls_pemfile::certs;
+use std::io::{BufReader, Cursor};
+use tokio_rustls::rustls;
+
+pub fn load_certs(data: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    certs(&mut BufReader::new(Cursor::new(data)))
+        .map(|result| result.unwrap())
+        .collect()
+}
+
+pub fn load_private_key(key: &str) -> rustls::pki_types::PrivateKeyDer<'_> {
+    let mut reader = BufReader::new(Cursor::new(key));
+    loop {
+        match rustls_pemfile::read_one(&mut reader)
+            .expect("cannot parse private key .pem file")
+        {
+            Some(rustls_pemfile::Item::Pkcs1Key(key)) => return key.into(),
+            Some(rustls_pemfile::Item::Pkcs8Key(key)) => return key.into(),
+            Some(rustls_pemfile::Item::Sec1Key(key)) => return key.into(),
+            None => break,
+            _ => continue,
+        }
+    }
+    panic!("no keys found (encrypted keys not supported)");
+}
+```
+
+## Setting up the TLS server
+
+<Steps>
+  <Step title="Build the server TLS configuration">
+    Load the server's certificate chain and private key, then optionally configure mutual TLS (client-certificate authentication).
+
+    ```rust filename="src/server.rs"
+    use std::sync::Arc;
+    use tokio_rustls::rustls::{self, RootCertStore, server::WebPkiClientVerifier};
+    use tokio_rustls::TlsAcceptor;
+
+    // Server certificate and key
+    let cert = load_certs(END_CERT);
+    let key = load_private_key(END_PRIVATEKEY);
+
+    // ---- mutual TLS: build a client-cert verifier ----
+    let mut client_auth_roots = RootCertStore::empty();
+    for root in load_certs(CLIENT_CHAIN_CLIENT_AUTH) {
+        client_auth_roots.add(root).unwrap();
+    }
+    let client_auth = WebPkiClientVerifier::builder(client_auth_roots.into())
+        .build()
+        .map_err(std::io::Error::other)
+        .unwrap();
+    // Use .with_no_client_auth() instead if you don't want mutual TLS.
+
+    let config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(Arc::from(client_auth))
+        .with_single_cert(cert, key)
+        .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    ```
+  </Step>
+
+  <Step title="Accept TLS connections and create transports">
+    Bind a raw `TcpListener`, accept each TCP stream, wrap it with `acceptor.accept()`, then frame it with the length-delimited codec and hand it to tarpc.
+
+    ```rust filename="src/server.rs"
+    use tarpc::{
+        server::{BaseChannel, Channel},
+        serde_transport as transport,
+        tokio_serde::formats::Bincode,
+        tokio_util::codec::length_delimited::LengthDelimitedCodec,
+    };
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:5000").await.unwrap();
+    let codec_builder = LengthDelimitedCodec::builder();
+
+    async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
+        tokio::spawn(fut);
+    }
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _peer_addr) = listener.accept().await.unwrap();
+            // Perform TLS handshake
+            let tls_stream = acceptor.accept(stream).await.unwrap();
+            // Frame the TLS stream, then wrap in a serde transport
+            let framed = codec_builder.new_framed(tls_stream);
+            let transport = transport::new(framed, Bincode::default());
+
+            let fut = BaseChannel::with_defaults(transport)
+                .execute(Service.serve())
+                .for_each(spawn);
+            tokio::spawn(fut);
+        }
+    });
+    ```
+
+    <Tip>
+    `transport::new(framed, codec)` is the low-level constructor that underpins `tcp::listen`. Because TLS gives you an `AsyncRead + AsyncWrite`, you use it directly instead of the `tcp` helpers.
+    </Tip>
+  </Step>
+</Steps>
+
+## Setting up the TLS client
+
+<Steps>
+  <Step title="Build the client TLS configuration">
+    Add the server's CA chain to the root store and, if the server requires it, attach client credentials.
+
+    ```rust filename="src/client.rs"
+    use tokio_rustls::rustls;
+    use tokio_rustls::TlsConnector;
+
+    let mut root_store = rustls::RootCertStore::empty();
+    for root in load_certs(END_CHAIN) {
+        root_store.add(root).unwrap();
+    }
+
+    // Provide client certificate for mutual TLS
+    let client_key = load_private_key(CLIENT_PRIVATEKEY_CLIENT_AUTH);
+    let client_certs = load_certs(CLIENT_CERT_CLIENT_AUTH);
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(client_certs, client_key)?;
+    // Use .with_no_client_auth() if the server doesn't require a client cert.
+
+    let connector = TlsConnector::from(Arc::new(config));
+    ```
+  </Step>
+
+  <Step title="Connect and create the tarpc client">
+    Connect the TCP stream, complete the TLS handshake, then frame and wrap it the same way as the server.
+
+    ```rust filename="src/client.rs"
+    use tarpc::{client, serde_transport as transport, tokio_serde::formats::Bincode};
+    use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
+    use tokio::net::TcpStream;
+
+    let domain = rustls::pki_types::ServerName::try_from("localhost")?;
+    let stream = TcpStream::connect("127.0.0.1:5000").await?;
+    let tls_stream = connector.connect(domain, stream).await?;
+
+    let codec_builder = LengthDelimitedCodec::builder();
+    let transport = transport::new(codec_builder.new_framed(tls_stream), Bincode::default());
+
+    let answer = PingServiceClient::new(client::Config::default(), transport)
+        .spawn()
+        .ping(tarpc::context::current())
+        .await?;
+
+    println!("ping answer: {answer}");
+    ```
+  </Step>
+</Steps>
+
+## Complete example
+
+The full runnable version is the `tls_over_tcp` example in the tarpc repository. It defines a minimal `PingService` and exercises both server-side TLS and mutual TLS client authentication end-to-end:
+
+```rust filename="examples/tls_over_tcp.rs"
+#[tarpc::service]
+pub trait PingService {
+    async fn ping() -> String;
+}
+
+#[derive(Clone)]
+struct Service;
+
+impl PingService for Service {
+    async fn ping(self, _: Context) -> String {
+        "🔒".to_owned()
+    }
+}
+```
+
+Run it with:
+
+```bash
+cargo run --example tls_over_tcp --features full
+```
+
+<Warning>
+The example embeds test certificates generated with OpenSSL 3. **Never use these certificates in production.** Generate your own CA and end-entity certs with a tool like `rcgen`, `openssl`, or `cfssl`.
+</Warning>
+
+## Disabling mutual TLS
+
+Both the server and client configurations support one-way TLS (server authenticates to client only):
+
+```rust filename="one-way TLS"
+// Server: no client certificate verification
+let config = rustls::ServerConfig::builder()
+    .with_no_client_auth()
+    .with_single_cert(cert, key)
+    .unwrap();
+
+// Client: no client certificate
+let config = rustls::ClientConfig::builder()
+    .with_root_certificates(root_store)
+    .with_no_client_auth();
+```

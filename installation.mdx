@@ -1,0 +1,153 @@
+---
+title: "Installing and configuring tarpc in your Rust project"
+sidebarTitle: "Installation"
+description: "Add tarpc 0.38 to your Rust project, understand every Cargo feature flag, and pick the right combination for in-process, TCP, or bincode transports."
+---
+
+tarpc is published on [crates.io](https://crates.io/crates/tarpc) and requires **Rust 1.85.0** or later. This page explains how to add tarpc to your `Cargo.toml`, what each Cargo feature flag enables, and which combinations are appropriate for common use cases.
+
+## Minimum requirements
+
+| Requirement | Version |
+|---|---|
+| tarpc | **0.38.0** |
+| Rust (MSRV) | **1.85.0** |
+| Rust edition | 2024 |
+
+<Warning>
+  tarpc uses async functions in traits (AFIT), which stabilised in Rust 1.75.
+  However, the 2024 edition is required starting with tarpc 0.34. Make sure
+  your toolchain is up to date before adding tarpc to an existing project.
+</Warning>
+
+## Feature flags
+
+tarpc has **no default features**. You must opt in to the capabilities you need. The table below lists every available feature flag.
+
+| Feature | Enables | Pulls in |
+|---|---|---|
+| `tokio1` | Tokio runtime integration required by the server and client task machinery | `tokio/rt` |
+| `serde1` | `Serialize + Deserialize` impls on all request and response types | `serde`, `serde/derive`, `serde/rc` |
+| `serde-transport` | The generic `serde_transport` module for framing messages over async I/O | `serde1`, `tokio1`, `tokio-serde`, `tokio-util/codec` |
+| `serde-transport-json` | JSON framing via `tokio-serde` (enables `serde_transport::tcp` with JSON) | `serde-transport`, `tokio-serde/json` |
+| `serde-transport-bincode` | Bincode framing via `tokio-serde` (enables `serde_transport::tcp` with Bincode) | `serde-transport`, `tokio-serde/bincode` |
+| `tcp` | TCP listener and connector helpers in `serde_transport::tcp` | `tokio/net` |
+| `unix` | Unix Domain Socket helpers in `serde_transport::unix` | `tokio/net` |
+| `full` | All of the above | everything above |
+
+<Note>
+  The in-process `tarpc::transport::channel` transport is always available and
+  requires **no feature flags** beyond `tokio1`. It is useful for testing and
+  for services that communicate within the same process.
+</Note>
+
+## Common configurations
+
+Choose the snippet below that matches your use case.
+
+### In-process channel only
+
+Use this configuration when your client and server live in the same process — for example, in unit tests or single-binary applications that don't need to talk over the network.
+
+```toml Cargo.toml
+[dependencies]
+futures = "0.3"
+tarpc   = { version = "0.38", features = ["tokio1"] }
+tokio   = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+```
+
+### TCP transport with JSON serialization
+
+Use this when you need to communicate over the network and want human-readable wire messages. JSON is convenient for debugging but has higher serialization overhead than binary formats.
+
+```toml Cargo.toml
+[dependencies]
+anyhow  = "1.0"
+futures = "0.3"
+tarpc   = { version = "0.38", features = ["serde-transport-json", "tcp"] }
+tokio   = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+```
+
+### TCP transport with Bincode serialization
+
+Use this for production network services where performance matters. Bincode is a compact binary format that is significantly faster to serialize and deserialize than JSON.
+
+```toml Cargo.toml
+[dependencies]
+anyhow  = "1.0"
+bincode = { version = "2.0", features = ["serde"] }
+futures = "0.3"
+tarpc   = { version = "0.38", features = ["serde-transport-bincode", "tcp"] }
+tokio   = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+```
+
+### Unix Domain Sockets
+
+Use this for inter-process communication on the same host. UDS avoids network overhead entirely and is only available on Unix-like operating systems.
+
+```toml Cargo.toml
+[dependencies]
+anyhow  = "1.0"
+futures = "0.3"
+tarpc   = { version = "0.38", features = ["serde-transport-json", "unix"] }
+tokio   = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+```
+
+### All features enabled
+
+Enable everything — useful when prototyping or when you want to explore the full API surface without worrying about feature flags.
+
+```toml Cargo.toml
+[dependencies]
+anyhow  = "1.0"
+futures = "0.3"
+tarpc   = { version = "0.38", features = ["full"] }
+tokio   = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+```
+
+## Feature dependency graph
+
+Some features automatically enable others. The diagram below shows the relationships:
+
+```
+full
+├── serde1
+├── tokio1
+├── serde-transport  →  serde1 + tokio1 + tokio-serde + tokio-util/codec
+│   ├── serde-transport-json     →  serde-transport + tokio-serde/json
+│   └── serde-transport-bincode  →  serde-transport + tokio-serde/bincode
+├── tcp    →  tokio/net
+└── unix   →  tokio/net
+```
+
+<Tip>
+  If you enable `serde-transport-json` or `serde-transport-bincode`, you do
+  **not** need to separately list `serde-transport`, `serde1`, or `tokio1` —
+  they are pulled in transitively.
+</Tip>
+
+## Verifying the installation
+
+After updating `Cargo.toml`, run:
+
+```bash
+cargo build
+```
+
+If the build succeeds, tarpc is correctly installed. To confirm the version that was resolved:
+
+```bash
+cargo tree -i tarpc
+```
+
+You should see output similar to:
+
+```
+tarpc v0.38.0
+```
+
+## Next steps
+
+- Follow the [Quickstart](/quickstart) guide to write your first working service.
+- Read the full [API documentation](https://docs.rs/tarpc/0.38.0) on docs.rs.
+- Browse the [RELEASES](https://github.com/google/tarpc/blob/master/RELEASES.md) file for a history of breaking changes.

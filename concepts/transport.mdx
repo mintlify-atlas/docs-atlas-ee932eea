@@ -1,0 +1,285 @@
+---
+sidebarTitle: "Transport"
+title: "How tarpc transports connect clients and servers together"
+description: "Discover tarpc's transport model: the Transport trait, in-process channels, serde_transport over TCP or Unix sockets, codecs, and when to use each."
+---
+
+tarpc is completely transport-agnostic. The only requirement for wiring a client to a server is that the connection type implements the `Transport` sealed trait — a bidirectional `Stream + Sink` of typed messages. tarpc ships with an in-process channel for testing and local use, and a generic `serde_transport` module for real network communication. You can also implement `Transport` yourself for any medium you choose.
+
+## The Transport Trait
+
+`Transport` lives in `tarpc::transport::sealed` and is automatically implemented for any type that is both a `Stream<Item = Result<Item, E>>` and a `Sink<SinkItem, Error = E>` where `E: Error + Send + Sync + 'static`:
+
+```rust filename="tarpc/src/transport.rs (abridged)"
+pub trait Transport<SinkItem, Item>
+where
+    Self: Stream<Item = Result<Item, <Self as Sink<SinkItem>>::Error>>,
+    Self: Sink<SinkItem, Error = <Self as Transport<SinkItem, Item>>::TransportError>,
+    <Self as Sink<SinkItem>>::Error: Error,
+{
+    type TransportError: Error + Send + Sync + 'static;
+}
+```
+
+You import `Transport` via `tarpc::Transport` (a re-export of the sealed trait). In practice, you rarely interact with `Transport` directly — you pass the concrete transport type to `BaseChannel::with_defaults` or `YourClient::new` and tarpc handles the rest.
+
+## In-Process Channel Transport
+
+`tarpc::transport::channel` provides two zero-copy, in-memory transports suitable for testing and for connecting components within the same process.
+
+### `channel::unbounded()`
+
+Returns two `UnboundedChannel` peers. Each side is both a `Stream` and a `Sink`, and items sent through one peer's `Sink` arrive on the other's `Stream`. There is no bound on the number of buffered messages.
+
+```rust filename="src/tests.rs"
+use tarpc::transport::channel;
+
+let (client_transport, server_transport) = channel::unbounded();
+```
+
+### `channel::bounded(capacity)`
+
+Returns two `Channel` peers backed by bounded `futures::channel::mpsc` channels. Use this when you want back-pressure in tests:
+
+```rust filename="src/tests.rs"
+use tarpc::transport::channel;
+
+let (client_transport, server_transport) = channel::bounded(32);
+```
+
+Both `UnboundedChannel` and `Channel` automatically satisfy the `Transport` trait and can be used as drop-in transports for any tarpc client or server.
+
+## `serde_transport`: Network Transports
+
+The `serde-transport` Cargo feature unlocks `tarpc::serde_transport`, a generic transport that wraps any `AsyncRead + AsyncWrite` stream with [tokio-serde](https://docs.rs/tokio-serde) framing and a configurable serialization codec.
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.37", features = ["serde-transport", "tokio1"] }
+tokio-serde = { version = "0.9", features = ["json"] }  # or "bincode"
+```
+
+The `serde_transport::Transport<S, Item, SinkItem, Codec>` type wraps:
+
+1. A length-delimited framing layer (`tokio_util::codec::LengthDelimitedCodec`).
+2. A `tokio-serde` codec layer (`Codec`) that serializes outgoing messages and deserializes incoming ones.
+
+### TCP Transport
+
+The `tcp` feature adds `serde_transport::tcp`:
+
+```toml filename="Cargo.toml"
+tarpc = { version = "0.37", features = ["serde-transport", "tcp", "tokio1"] }
+```
+
+**Server side** — listen for connections:
+
+```rust filename="src/server.rs"
+use futures::prelude::*;
+use tarpc::{
+    server::{self, BaseChannel, Channel, incoming::Incoming},
+    serde_transport::tcp,
+};
+use tokio_serde::formats::Json;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut listener = tcp::listen("127.0.0.1:8080", Json::default).await?;
+    println!("Listening on {}", listener.local_addr());
+
+    listener
+        // Each item is a Result<Transport<TcpStream, …>>
+        .filter_map(|r| async move { r.ok() })
+        .map(BaseChannel::with_defaults)
+        .execute(HelloServer.serve())
+        .for_each(|channel| async move {
+            tokio::spawn(channel.for_each(|resp| async move { tokio::spawn(resp); }));
+        })
+        .await;
+
+    Ok(())
+}
+```
+
+**Client side** — connect to the server:
+
+```rust filename="src/client.rs"
+use tarpc::{client, context, serde_transport::tcp};
+use tokio_serde::formats::Json;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let transport = tcp::connect("127.0.0.1:8080", Json::default).await?;
+
+    let client = WorldClient::new(client::Config::default(), transport).spawn();
+    let greeting = client.hello(context::current(), "Alice".to_string()).await?;
+    println!("{greeting}");
+
+    Ok(())
+}
+```
+
+<Note>
+  `tcp::connect` returns a `TcpConnect` future that also exposes a `config_mut()` method for adjusting the `LengthDelimitedCodec` framing (e.g., max frame length) before the connection is established.
+</Note>
+
+### Unix Domain Socket Transport
+
+The `unix` feature (Unix platforms only) adds `serde_transport::unix`:
+
+```toml filename="Cargo.toml"
+tarpc = { version = "0.37", features = ["serde-transport", "unix", "tokio1"] }
+```
+
+```rust filename="src/server.rs"
+use tarpc::serde_transport::unix;
+use tokio_serde::formats::Json;
+
+let mut listener = unix::listen("/tmp/my_service.sock", Json::default).await?;
+```
+
+```rust filename="src/client.rs"
+use tarpc::serde_transport::unix;
+use tokio_serde::formats::Json;
+
+let transport = unix::connect("/tmp/my_service.sock", Json::default).await?;
+```
+
+`unix::TempPathBuf` is a convenience wrapper that creates a socket path in `$TMPDIR` and deletes the socket file when dropped — useful for tests.
+
+## Codec Formats
+
+`serde_transport` is codec-agnostic: any `tokio_serde::Serializer + Deserializer` pair works. The most common choices are:
+
+| Codec | Crate feature | Notes |
+|-------|---------------|-------|
+| `SymmetricalJson` | `tokio-serde/json` | Human-readable, easy to debug with `tcpdump`. Larger on the wire. |
+| `SymmetricalBincode` | `tokio-serde/bincode` | Compact binary format; faster than JSON for numeric-heavy payloads. |
+| `SymmetricalMessagePack` | `tokio-serde/messagepack` | Alternative compact binary format. |
+| `SymmetricalCbor` | `tokio-serde/cbor` | IETF-standard binary JSON superset. |
+
+Pass the codec as a closure (not a value) so each accepted connection gets its own instance:
+
+```rust filename="src/server.rs"
+// Json::default is a zero-argument function pointer; it matches Fn() -> Codec.
+tcp::listen("0.0.0.0:0", tokio_serde::formats::Json::default).await?;
+```
+
+## Choosing a Transport
+
+<Tabs>
+  <Tab title="In-process channel">
+    **When to use:** unit tests, integration tests, benchmarks, components living in the same Tokio runtime.
+
+    **Key properties:**
+    - Zero serialization overhead — messages are passed as-is.
+    - `Send + 'static` optional: because there's no network hop, you're not forced to make requests `Send`.
+    - `unbounded()` never back-pressures; `bounded(n)` gives explicit back-pressure.
+
+    ```rust filename="src/tests.rs"
+    let (client_transport, server_transport) =
+        tarpc::transport::channel::unbounded();
+    ```
+  </Tab>
+  <Tab title="TCP + serde">
+    **When to use:** microservice communication over a network, client-server applications.
+
+    **Key properties:**
+    - Works across machines and processes.
+    - Requires the `serde-transport` + `tcp` features and a `Serialize + Deserialize` codec.
+    - Reliable, ordered delivery (TCP guarantees).
+    - `tcp::Incoming` implements `Stream<Item = io::Result<Transport<TcpStream, …>>>` and integrates directly with `Incoming::execute`.
+
+    ```rust filename="src/server.rs"
+    let listener = tarpc::serde_transport::tcp::listen(
+        "0.0.0.0:9000",
+        tokio_serde::formats::Bincode::default,
+    ).await?;
+    ```
+  </Tab>
+  <Tab title="Unix socket + serde">
+    **When to use:** IPC between processes on the same host where TCP overhead is undesirable.
+
+    **Key properties:**
+    - Lower latency than TCP on the same machine (no TCP/IP stack traversal).
+    - Unix-only (Linux, macOS).
+    - Requires the `serde-transport` + `unix` features.
+    - Use `TempPathBuf::with_random` for ephemeral test sockets.
+
+    ```rust filename="src/server.rs"
+    let listener = tarpc::serde_transport::unix::listen(
+        "/run/my_service.sock",
+        tokio_serde::formats::Json::default,
+    ).await?;
+    ```
+  </Tab>
+  <Tab title="Custom transport">
+    **When to use:** WebSockets, QUIC, shared memory, or any `AsyncRead + AsyncWrite` medium not covered above.
+
+    Implement `Stream<Item = Result<Item, E>>` + `Sink<SinkItem, Error = E>` where `E: Error + Send + Sync + 'static`. Your type will automatically satisfy the `Transport` trait.
+
+    ```rust filename="src/custom_transport.rs"
+    use futures::{Sink, Stream};
+
+    struct MyTransport { /* … */ }
+
+    impl Stream for MyTransport {
+        type Item = std::io::Result<MyResponse>;
+        // …
+    }
+
+    impl Sink<MyRequest> for MyTransport {
+        type Error = std::io::Error;
+        // …
+    }
+
+    // MyTransport now satisfies tarpc::Transport<MyRequest, MyResponse>
+    ```
+  </Tab>
+</Tabs>
+
+## Full In-Process Example
+
+```rust filename="examples/readme.rs"
+use futures::prelude::*;
+use tarpc::{
+    client, context,
+    server::{self, Channel},
+};
+
+#[tarpc::service]
+pub trait World {
+    async fn hello(name: String) -> String;
+}
+
+#[derive(Clone)]
+struct HelloServer;
+
+impl World for HelloServer {
+    async fn hello(self, _: context::Context, name: String) -> String {
+        format!("Hello, {name}!")
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Create a pair of in-process transports.
+    let (client_transport, server_transport) =
+        tarpc::transport::channel::unbounded();
+
+    // Start the server.
+    let server = server::BaseChannel::with_defaults(server_transport);
+    tokio::spawn(
+        server
+            .execute(HelloServer.serve())
+            .for_each(|resp| async move { tokio::spawn(resp); }),
+    );
+
+    // Connect the client and make a call.
+    let client = WorldClient::new(client::Config::default(), client_transport).spawn();
+    let hello = client.hello(context::current(), "Stim".to_string()).await?;
+    println!("{hello}");
+
+    Ok(())
+}
+```

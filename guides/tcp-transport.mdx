@@ -1,0 +1,250 @@
+---
+sidebarTitle: "TCP Transport"
+title: "Connect and serve tarpc RPC services over TCP sockets"
+description: "Learn how to expose and consume tarpc services over TCP using serde_transport::tcp, covering JSON and Bincode serialization codecs."
+---
+
+tarpc ships a ready-made Serde-based transport layer that wraps any `AsyncRead + AsyncWrite` stream. The `serde_transport::tcp` module builds on top of that to give you convenient `listen` and `connect` helpers that work directly with Tokio TCP sockets. This guide walks through adding the right Cargo features, starting a TCP listener, connecting a client, and choosing between JSON and Bincode codecs.
+
+## Cargo features
+
+The TCP transport lives behind two optional feature flags. Add them to your `Cargo.toml`:
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["serde-transport", "tcp"] }
+tokio = { version = "1", features = ["full"] }
+tokio-serde = { version = "0.9", features = ["json"] }   # or "bincode"
+```
+
+| Feature | Enables |
+|---|---|
+| `serde-transport` | The `tarpc::serde_transport` module and the `Transport` type |
+| `tcp` | `serde_transport::tcp::listen` and `serde_transport::tcp::connect` |
+| `serde-transport-json` | Shortcut that pulls in `serde-transport` + `tokio-serde/json` |
+| `serde-transport-bincode` | Shortcut that pulls in `serde-transport` + `tokio-serde/bincode` |
+
+<Note>
+`serde-transport-json` and `serde-transport-bincode` are convenience aliases — they activate `serde-transport` automatically so you don't need to list both.
+</Note>
+
+## Defining a service
+
+Start with the `#[tarpc::service]` attribute macro to generate client and server stubs:
+
+```rust filename="src/lib.rs"
+#[tarpc::service]
+pub trait World {
+    /// Returns a greeting for name.
+    async fn hello(name: String) -> String;
+}
+```
+
+The macro generates a `WorldClient` type and a `World::serve()` method you'll use on both sides.
+
+## Setting up a TCP server
+
+<Steps>
+  <Step title="Bind a listener">
+    Call `serde_transport::tcp::listen` with an address and a codec factory function. The function is called once per accepted connection.
+
+    ```rust filename="src/server.rs"
+    use futures::prelude::*;
+    use tarpc::{
+        context,
+        server::{self, Channel, incoming::Incoming},
+        tokio_serde::formats::Json,
+    };
+
+    #[derive(Clone)]
+    struct HelloServer;
+
+    impl World for HelloServer {
+        async fn hello(self, _: context::Context, name: String) -> String {
+            format!("Hello, {name}!")
+        }
+    }
+
+    async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
+        tokio::spawn(fut);
+    }
+
+    #[tokio::main]
+    async fn main() -> anyhow::Result<()> {
+        let mut listener =
+            tarpc::serde_transport::tcp::listen("localhost:8080", Json::default).await?;
+
+        println!("Listening on {}", listener.local_addr());
+        // ...
+    ```
+  </Step>
+
+  <Step title="Accept and serve connections">
+    `tcp::listen` returns an `Incoming` stream that yields `Transport` items. Wrap each one in a `BaseChannel` and execute the server handler.
+
+    ```rust filename="src/server.rs"
+        listener
+            .filter_map(|r| future::ready(r.ok()))
+            .map(server::BaseChannel::with_defaults)
+            // Limit to 1 connection per IP address
+            .max_channels_per_key(1, |t| t.transport().peer_addr().unwrap().ip())
+            .map(|channel| channel.execute(HelloServer.serve()).for_each(spawn))
+            // Process up to 10 channels concurrently
+            .buffer_unordered(10)
+            .for_each(|_| async {})
+            .await;
+
+        Ok(())
+    }
+    ```
+
+    `Incoming::max_channels_per_key` enforces connection limits keyed on an arbitrary value — here, the client's IP. `buffer_unordered(10)` caps the total number of concurrent channels.
+  </Step>
+
+  <Step title="Configure the frame length">
+    By default the length-delimited codec enforces an 8 MiB maximum frame size. Increase it via the listener's `config_mut()` when you expect large payloads:
+
+    ```rust filename="src/server.rs"
+    let mut listener =
+        tarpc::serde_transport::tcp::listen("localhost:8080", Json::default).await?;
+    listener.config_mut().max_frame_length(usize::MAX);
+    ```
+  </Step>
+</Steps>
+
+## Connecting a client
+
+<Steps>
+  <Step title="Establish the transport">
+    `tcp::connect` returns a `TcpConnect` future. Call `.await` to resolve it into a `Transport`.
+
+    ```rust filename="src/client.rs"
+    use tarpc::{client, context, tokio_serde::formats::Json};
+
+    #[tokio::main]
+    async fn main() -> anyhow::Result<()> {
+        let mut connect = tarpc::serde_transport::tcp::connect("localhost:8080", Json::default);
+        connect.config_mut().max_frame_length(usize::MAX);
+        let transport = connect.await?;
+        // ...
+    ```
+  </Step>
+
+  <Step title="Create the client and make calls">
+    Pass the transport to the generated `WorldClient::new`, then call `.spawn()` to drive the connection in the background.
+
+    ```rust filename="src/client.rs"
+        let client = WorldClient::new(client::Config::default(), transport).spawn();
+
+        let greeting = client.hello(context::current(), "Alice".into()).await?;
+        println!("{greeting}");
+        Ok(())
+    }
+    ```
+  </Step>
+</Steps>
+
+## Choosing a codec
+
+tarpc ships two built-in `tokio-serde` codecs. Both encode a length prefix so messages can be framed over a raw TCP stream.
+
+<CodeGroup>
+```rust filename="JSON codec"
+use tarpc::tokio_serde::formats::Json;
+
+// server
+let listener = tcp::listen("localhost:8080", Json::default).await?;
+
+// client
+let transport = tcp::connect("localhost:8080", Json::default).await?;
+```
+
+```rust filename="Bincode codec"
+use tarpc::tokio_serde::formats::Bincode;
+
+// server
+let listener = tcp::listen("localhost:8080", Bincode::default).await?;
+
+// client
+let transport = tcp::connect("localhost:8080", Bincode::default).await?;
+```
+</CodeGroup>
+
+| Codec | Feature flag | Notes |
+|---|---|---|
+| `Json` | `serde-transport-json` | Human-readable; good for debugging |
+| `Bincode` | `serde-transport-bincode` | Compact binary; lower overhead |
+
+<Tip>
+JSON is easier to inspect with tools like `netcat` or Wireshark during development. Switch to Bincode for production to reduce per-message size and serialization cost.
+</Tip>
+
+## Accessing peer address
+
+Both the server-side `Transport` and the client-side `Transport` expose the remote address:
+
+```rust filename="peer address"
+// Inside a server handler or channel setup:
+let peer_ip = channel.transport().peer_addr()?.ip();
+
+// On the client-side transport before spawning:
+let peer = transport.peer_addr()?;
+```
+
+## Complete working example
+
+The example below mirrors the pattern used in the tarpc `example-service` crate. It starts a server on a random port and immediately connects a client.
+
+```rust filename="examples/tcp_hello.rs"
+use futures::prelude::*;
+use tarpc::{
+    client, context,
+    server::{self, Channel, incoming::Incoming},
+    tokio_serde::formats::Json,
+};
+
+#[tarpc::service]
+pub trait World {
+    async fn hello(name: String) -> String;
+}
+
+#[derive(Clone)]
+struct HelloServer;
+
+impl World for HelloServer {
+    async fn hello(self, _: context::Context, name: String) -> String {
+        format!("Hello, {name}!")
+    }
+}
+
+async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
+    tokio::spawn(fut);
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Start server on a random port
+    let mut listener =
+        tarpc::serde_transport::tcp::listen("localhost:0", Json::default).await?;
+    let addr = listener.local_addr();
+
+    tokio::spawn(async move {
+        listener
+            .filter_map(|r| future::ready(r.ok()))
+            .map(server::BaseChannel::with_defaults)
+            .map(|ch| ch.execute(HelloServer.serve()).for_each(spawn))
+            .buffer_unordered(10)
+            .for_each(|_| async {})
+            .await;
+    });
+
+    // Connect and call
+    let transport = tarpc::serde_transport::tcp::connect(addr, Json::default).await?;
+    let client = WorldClient::new(client::Config::default(), transport).spawn();
+
+    let reply = client.hello(context::current(), "World".into()).await?;
+    println!("{reply}");
+
+    Ok(())
+}
+```

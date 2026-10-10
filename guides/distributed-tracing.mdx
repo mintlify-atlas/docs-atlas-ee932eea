@@ -1,0 +1,201 @@
+---
+sidebarTitle: "Distributed Tracing"
+title: "Trace tarpc requests across services with OpenTelemetry"
+description: "Instrument tarpc services with tracing-subscriber and OpenTelemetry OTLP to propagate trace context across RPC boundaries automatically."
+---
+
+tarpc has first-class, built-in support for distributed tracing via the `tracing` and `tracing-opentelemetry` crates. Every request dispatched through tarpc automatically creates a span, and the `context::Context` struct carries deadline and trace information between services so that multi-hop calls appear as a single, connected trace in your observability backend.
+
+## How tarpc emits traces
+
+tarpc instruments its internal request dispatching with `tracing` spans. No user code is required to get basic span data — every call to a generated client method is wrapped in a span that records the service name, method name, and request ID. Child services that make outbound RPCs inherit the current trace context through `context::current()`.
+
+## Dependencies
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+```
+
+## Initializing the tracing subscriber
+
+The `init_tracing` pattern, used in both the `example-service` crate and the `tracing` example, wires together three layers:
+
+1. An `EnvFilter` that reads log levels from `RUST_LOG`
+2. A `fmt` layer for human-readable console output
+3. A `tracing-opentelemetry` layer that exports spans to an OTLP-compatible backend (Jaeger, Tempo, Honeycomb, etc.)
+
+```rust filename="src/lib.rs"
+use opentelemetry::trace::TracerProvider as _;
+use tracing_subscriber::{fmt::format::FmtSpan, prelude::*};
+
+/// Initializes an OpenTelemetry tracing subscriber with an OTLP backend.
+pub fn init_tracing(
+    service_name: &'static str,
+) -> anyhow::Result<opentelemetry_sdk::trace::SdkTracerProvider> {
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name(service_name)
+                .build(),
+        )
+        .with_batch_exporter(
+            opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .build()
+                .unwrap(),
+        )
+        .build();
+
+    opentelemetry::global::set_tracer_provider(tracer_provider.clone());
+    let tracer = tracer_provider.tracer(service_name);
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE),
+        )
+        .with(tracing_opentelemetry::layer().with_tracer(tracer))
+        .try_init()?;
+
+    Ok(tracer_provider)
+}
+```
+
+Call `init_tracing` at the start of both your server and client binaries:
+
+```rust filename="src/server.rs"
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let tracer_provider = init_tracing("my-service-server")?;
+    // ... set up listener, serve ...
+    tracer_provider.shutdown()?;
+    Ok(())
+}
+```
+
+<Note>
+`tracer_provider.shutdown()` flushes the batch exporter before the process exits. Always call it, otherwise the last batch of spans may be lost.
+</Note>
+
+## Propagating trace context with `context::current()`
+
+`context::Context` is the first argument of every tarpc handler and the first argument of every client call. It carries the request deadline and the current `tracing::Span`. When a service makes an outbound RPC, passing `context::current()` captures the active span and sets it as the parent for the remote call's span.
+
+```rust filename="src/double_service.rs"
+use tarpc::context;
+
+impl Double for DoubleServer {
+    async fn double(self, _ctx: context::Context, x: i32) -> Result<i32, String> {
+        // context::current() captures the active tracing span, so the
+        // downstream `add` call becomes a child span in the same trace.
+        self.add_client
+            .add(context::current(), x, x)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+```
+
+This is what enables end-to-end trace propagation across service boundaries without any manual context injection.
+
+## Multi-service tracing example
+
+The `tracing` example in the repository demonstrates a two-level service tree: a `DoubleServer` that calls an `AddServer` internally. The complete flow from a single client call produces a trace with three spans.
+
+```rust filename="examples/tracing.rs (excerpt)"
+// AddServer — leaf service
+#[derive(Clone)]
+struct AddServer;
+
+impl AddService for AddServer {
+    async fn add(self, _: context::Context, x: i32, y: i32) -> i32 {
+        x + y
+    }
+}
+
+// DoubleServer — calls AddServer via RPC
+#[derive(Clone)]
+struct DoubleServer<Stub> {
+    add_client: add::AddClient<Stub>,
+}
+
+impl<Stub: AddStub + Clone + Send + Sync + 'static> DoubleService for DoubleServer<Stub> {
+    async fn double(self, _: context::Context, x: i32) -> Result<i32, String> {
+        self.add_client
+            .add(context::current(), x, x)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+// Client code
+let ctx = context::current();
+for _ in 1..=5 {
+    tracing::info!("{:?}", double_client.double(ctx, 1).await?);
+}
+```
+
+Each `double_client.double(ctx, 1)` call produces a trace that looks like:
+
+```
+double (client) ──► double (server) ──► add (client) ──► add (server)
+```
+
+## Adding your own spans
+
+Use `tracing::info_span!` and `.instrument()` to annotate async work inside handlers or clients:
+
+```rust filename="src/client.rs"
+use tracing::Instrument;
+
+let hello = async move {
+    tokio::select! {
+        r1 = client.hello(context::current(), "Alice".into()) => r1,
+        r2 = client.hello(context::current(), "Bob".into())   => r2,
+    }
+}
+.instrument(tracing::info_span!("concurrent hellos"))
+.await;
+```
+
+## Running with a local Jaeger backend
+
+The OTLP exporter sends spans to `http://localhost:4317` by default (gRPC). Start Jaeger with:
+
+```bash
+docker run -d --name jaeger \
+  -p 4317:4317 \
+  -p 16686:16686 \
+  jaegertracing/all-in-one:latest
+```
+
+Then run the example:
+
+```bash
+RUST_LOG=info cargo run --example tracing --features full
+```
+
+Open `http://localhost:16686` to view the traces.
+
+<Tip>
+Set `RUST_LOG=tarpc=debug` to see tarpc's own internal span events, including request IDs and channel lifecycle events.
+</Tip>
+
+## Console subscriber for async task profiling
+
+tarpc's dev dependencies include `console-subscriber`, which integrates with [Tokio Console](https://github.com/tokio-rs/console) for per-task async profiling. Replace `init_tracing` with `console_subscriber::init()` during local debugging:
+
+```rust filename="src/main.rs (debug only)"
+#[cfg(debug_assertions)]
+console_subscriber::init();
+```

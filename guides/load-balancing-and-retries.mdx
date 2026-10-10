@@ -1,0 +1,222 @@
+---
+sidebarTitle: "Load Balancing"
+title: "Load balance and retry RPC requests with tarpc stubs"
+description: "Distribute requests across multiple backends with RoundRobin or ConsistentHash stubs, and automatically retry failures using the Retry stub."
+---
+
+tarpc abstracts the idea of "something that can make an RPC call" behind the `Stub` trait. Client channels, `RoundRobin`, `ConsistentHash`, and `Retry` all implement `Stub`, so they compose freely. On the server side, the `Incoming` extension trait provides matching primitives for capping connection counts and in-flight requests. This guide covers both halves.
+
+## The `Stub` trait
+
+```rust filename="tarpc/src/client/stub.rs"
+pub trait Stub {
+    type Req: RequestName;
+    type Resp;
+
+    async fn call(
+        &self,
+        ctx: context::Context,
+        request: Self::Req,
+    ) -> Result<Self::Resp, RpcError>;
+}
+```
+
+`Client::Channel` and any type that implements `Serve + Clone` automatically implement `Stub`, so local in-process services work as drop-in replacements for remote ones.
+
+## `RoundRobin` — cycling across backends
+
+`RoundRobin` wraps a `Vec` of identical stubs and advances an atomic counter on each call. The stubs cycle in order, distributing requests evenly regardless of latency.
+
+<Steps>
+  <Step title="Create connections to each backend">
+    ```rust filename="src/client.rs"
+    use tarpc::{client, serde_transport::tcp, tokio_serde::formats::Json};
+
+    let transport1 = tcp::connect("10.0.0.1:8080", Json::default).await?;
+    let transport2 = tcp::connect("10.0.0.2:8080", Json::default).await?;
+
+    let channel1 = tarpc::client::new(client::Config::default(), transport1).spawn();
+    let channel2 = tarpc::client::new(client::Config::default(), transport2).spawn();
+    ```
+  </Step>
+
+  <Step title="Wrap them in a RoundRobin stub">
+    ```rust filename="src/client.rs"
+    use tarpc::client::stub::load_balance::RoundRobin;
+
+    let stub = RoundRobin::new(vec![channel1, channel2]);
+    // Construct the generated client from the stub:
+    let client = WorldClient::from(stub);
+    ```
+  </Step>
+
+  <Step title="Call through the load-balancing client">
+    Each call goes to the next backend in the rotation transparently:
+
+    ```rust filename="src/client.rs"
+    let reply = client.hello(context::current(), "Alice".into()).await?;
+    ```
+  </Step>
+</Steps>
+
+## `ConsistentHash` — sticky routing by request content
+
+`ConsistentHash` hashes each request and maps the hash modulo the number of backends to select a stub. Equivalent requests always reach the same backend, which is useful for session affinity or cache locality.
+
+```rust filename="src/client.rs"
+use tarpc::client::stub::load_balance::ConsistentHash;
+
+// Requests implement Hash (e.g. a newtype wrapping a user ID)
+let stub = ConsistentHash::new(vec![channel1, channel2, channel3])?;
+let client = WorldClient::from(stub);
+```
+
+<Note>
+`ConsistentHash::new` returns `Err(TryFromIntError)` if the number of backends overflows a `u64`. `ConsistentHash::with_hasher` lets you supply a custom `BuildHasher`.
+</Note>
+
+## `Retry` — automatic retry on failure
+
+`Retry` wraps any stub and retries the call when a user-supplied predicate returns `true`. The predicate receives the result and the attempt number (starting at 1).
+
+```rust filename="src/client.rs"
+use tarpc::client::stub::retry::Retry;
+
+let retrying_stub = Retry::new(round_robin_stub, |resp, attempts| {
+    if let Err(e) = resp {
+        tracing::warn!("Attempt {attempts} failed: {e:?}");
+        attempts < 3
+    } else {
+        false
+    }
+});
+
+let client = WorldClient::from(retrying_stub);
+```
+
+### Arc wrapping requirement
+
+`Retry` wraps the request in `Arc<Req>` before forwarding to the inner stub, so the request can be cloned cheaply for each retry attempt without re-serialization:
+
+```rust filename="type signature"
+// Retry<F, Stub> implements Stub<Req = Req>
+// but its inner Stub must accept Arc<Req>
+impl<Stub, Req, F> stub::Stub for Retry<F, Stub>
+where
+    Req: RequestName,
+    Stub: stub::Stub<Req = Arc<Req>>,
+    F: Fn(&Result<Stub::Resp, RpcError>, u32) -> bool,
+```
+
+<Warning>
+If you intend to serialize `Arc<Req>` over the wire, enable the `rc` feature in the `serde` dependency. Without it, `serde` refuses to serialize `Arc` by design. Add `serde = { version = "1", features = ["rc"] }` to your `Cargo.toml`.
+</Warning>
+
+## Composing stubs: Retry + RoundRobin
+
+The `tracing` example demonstrates the canonical composition:
+
+```rust filename="examples/tracing.rs (excerpt)"
+use tarpc::{
+    ClientMessage, RequestName, Response, Transport,
+    client::{self, RpcError, stub::{load_balance, retry}},
+};
+use std::sync::Arc;
+
+fn make_stub<Req, Resp, const N: usize>(
+    backends: [impl Transport<ClientMessage<Arc<Req>>, Response<Resp>> + Send + Sync + 'static; N],
+) -> retry::Retry<
+    impl Fn(&Result<Resp, RpcError>, u32) -> bool + Clone,
+    load_balance::RoundRobin<client::Channel<Arc<Req>, Resp>>,
+>
+where
+    Req: RequestName + Send + Sync + 'static,
+    Resp: Send + Sync + 'static,
+{
+    let stub = load_balance::RoundRobin::new(
+        backends
+            .into_iter()
+            .map(|transport| tarpc::client::new(client::Config::default(), transport).spawn())
+            .collect(),
+    );
+    retry::Retry::new(stub, |resp, attempts| {
+        if let Err(e) = resp {
+            tracing::warn!("Got an error: {e:?}");
+            attempts < 3
+        } else {
+            false
+        }
+    })
+}
+
+// Usage:
+let add_client = add::AddClient::from(make_stub([transport1, transport2]));
+```
+
+## Server-side limits with `Incoming`
+
+The `Incoming` extension trait is implemented for every stream of `Channel`s. It adds two limit adapters.
+
+### `max_channels_per_key` — connection limits
+
+Drop new connections once a per-key count is reached. Keys are derived by a closure you supply.
+
+```rust filename="src/server.rs"
+use tarpc::server::{incoming::Incoming, BaseChannel};
+
+listener
+    .filter_map(|r| future::ready(r.ok()))
+    .map(BaseChannel::with_defaults)
+    // At most 1 simultaneous connection from the same IP
+    .max_channels_per_key(1, |channel| {
+        channel.transport().peer_addr().unwrap().ip()
+    })
+    .map(|channel| channel.execute(MyService.serve()).for_each(spawn))
+    .buffer_unordered(10)
+    .for_each(|_| async {})
+    .await;
+```
+
+Dropped channels are tracked with `Arc`-based reference counting and logged at `DEBUG` level when limits are exceeded or connections close.
+
+### `max_concurrent_requests_per_channel` — in-flight throttling
+
+Cap how many requests one channel can have in flight simultaneously. Requests exceeding the cap are immediately rejected with `io::ErrorKind::WouldBlock`.
+
+```rust filename="src/server.rs"
+listener
+    .filter_map(|r| future::ready(r.ok()))
+    .map(BaseChannel::with_defaults)
+    .max_concurrent_requests_per_channel(100)
+    .map(|channel| channel.execute(MyService.serve()).for_each(spawn))
+    .buffer_unordered(10)
+    .for_each(|_| async {})
+    .await;
+```
+
+<Tip>
+Combine both limits to protect against slow-connection attacks and runaway clients simultaneously:
+
+```rust
+listener
+    .filter_map(|r| future::ready(r.ok()))
+    .map(BaseChannel::with_defaults)
+    .max_channels_per_key(5, |c| c.transport().peer_addr().unwrap().ip())
+    .max_concurrent_requests_per_channel(50)
+    // ...
+```
+</Tip>
+
+## Summary
+
+| Stub | Strategy | Req type |
+|---|---|---|
+| `Channel<Req, Resp>` | Direct single connection | `Req` |
+| `RoundRobin<Stub>` | Round-robin across `Vec<Stub>` | `Stub::Req` |
+| `ConsistentHash<Stub>` | Hash-pinned routing | `Stub::Req` (must be `Hash`) |
+| `Retry<F, Stub>` | Retry-on-error wrapper | `Req` (inner stub gets `Arc<Req>`) |
+
+| Incoming adapter | Scope | Rejection behavior |
+|---|---|---|
+| `max_channels_per_key(n, key_fn)` | Per key across all channels | New channels silently dropped |
+| `max_concurrent_requests_per_channel(n)` | Per individual channel | Request rejected with `WouldBlock` |

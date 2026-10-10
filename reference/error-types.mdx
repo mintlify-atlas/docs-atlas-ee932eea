@@ -1,0 +1,265 @@
+---
+title: "Error types and error handling in tarpc"
+sidebarTitle: "Error Types"
+description: "Reference for all public tarpc error types — ServerError, ChannelError, and RpcError — with variants, fields, and idiomatic handling patterns."
+---
+
+tarpc uses a small hierarchy of structured error types that map cleanly onto the three layers of an RPC call: the server handler, the transport channel, and the client-visible result. Understanding where each error originates and how it travels through the system makes it straightforward to write handlers that distinguish recoverable from fatal conditions.
+
+## Error Flow
+
+```
+Server handler
+    └─ returns Err(ServerError)
+           │
+           ▼
+    tarpc::Response { message: Err(ServerError) }
+           │
+           ▼
+    Client: RpcError::Server(ServerError)
+```
+
+Transport-level failures bypass the server handler entirely and surface on the client as `RpcError::Channel`. Sending failures surface as `RpcError::Send`. Deadline expiry surfaces as `RpcError::DeadlineExceeded`. Shutdown of the dispatch task surfaces as `RpcError::Shutdown`.
+
+---
+
+## `ServerError`
+
+`ServerError` is the error type returned by service handler functions (`Serve::serve`). It represents an intentional server-side rejection — for example, rate limiting, authorization failure, or invalid input — as opposed to a transport failure. The server serializes it and sends it back to the client, where it becomes `RpcError::Server(ServerError)`.
+
+```rust filename="tarpc/src/lib.rs"
+#[derive(thiserror::Error, Clone, Debug, PartialEq, Eq, Hash)]
+#[error("{kind:?}: {detail}")]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde1", derive(serde::Serialize, serde::Deserialize))]
+pub struct ServerError {
+    pub kind: io::ErrorKind,
+    pub detail: String,
+}
+```
+
+<ParamField path="kind" type="io::ErrorKind">
+  An `std::io::ErrorKind` value that categorises the error. Use standard kinds such as `ErrorKind::PermissionDenied`, `ErrorKind::InvalidInput`, or `ErrorKind::Other` to give callers a machine-readable category without exposing internal details. When the `serde1` feature is enabled, `kind` is serialized as a `u32` to avoid brittleness across Rust versions.
+</ParamField>
+
+<ParamField path="detail" type="String">
+  A human-readable message describing what went wrong. This string is sent over the wire and displayed in the `Display` output (`"{kind:?}: {detail}"`), so keep it concise and free of sensitive information.
+</ParamField>
+
+### Constructor
+
+```rust
+impl ServerError {
+    pub fn new(kind: io::ErrorKind, detail: String) -> ServerError
+}
+```
+
+### Creating and Returning a `ServerError`
+
+```rust filename="src/server.rs"
+use std::io;
+use tarpc::{context, ServerError};
+
+async fn check_auth(token: &str) -> Result<(), ServerError> {
+    if token != "secret" {
+        return Err(ServerError::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid token".to_string(),
+        ));
+    }
+    Ok(())
+}
+```
+
+<Warning>
+`ServerError` is `#[non_exhaustive]`. If you match on it by field, always include a fallback arm. New fields may be added in future versions.
+</Warning>
+
+---
+
+## `ChannelError<E>`
+
+`ChannelError` is returned when a transport operation fails in a way that disconnects the channel entirely. It is generic over the underlying transport error type `E` and used by both the client-side `RequestDispatch` and the server-side `BaseChannel`.
+
+```rust filename="tarpc/src/lib.rs"
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+pub enum ChannelError<E>
+where
+    E: ?Sized,
+{
+    /// Could not read from the transport.
+    #[error("could not read from the transport")]
+    Read(#[source] Arc<E>),
+    /// Could not ready the transport for writes.
+    #[error("could not ready the transport for writes")]
+    Ready(#[source] Arc<E>),
+    /// Could not write to the transport.
+    #[error("could not write to the transport")]
+    Write(#[source] Arc<E>),
+    /// Could not flush the transport.
+    #[error("could not flush the transport")]
+    Flush(#[source] Arc<E>),
+    /// Could not close the write end of the transport.
+    #[error("could not close the write end of the transport")]
+    Close(#[source] Arc<E>),
+}
+```
+
+Each variant wraps its underlying transport error in an `Arc<E>`. The `Arc` is necessary because a single channel error is fanned out to all pending in-flight requests simultaneously — without reference counting the error would need to be cloned by value, which is not possible for unsized error types.
+
+<ResponseField name="Read" type="Arc<E>">
+  The transport failed while reading an incoming message. On the client, this causes all in-flight requests to fail with `RpcError::Channel(ChannelError::Read(...))`. On the server, the `BaseChannel` stream terminates.
+</ResponseField>
+
+<ResponseField name="Ready" type="Arc<E>">
+  The transport's `poll_ready` sink method returned an error, meaning the transport cannot accept new writes. The channel is considered broken.
+</ResponseField>
+
+<ResponseField name="Write" type="Arc<E>">
+  A message was accepted by `poll_ready` but `start_send` failed. On the client this surfaces per-request as `RpcError::Send` rather than `RpcError::Channel`.
+</ResponseField>
+
+<ResponseField name="Flush" type="Arc<E>">
+  The transport's `poll_flush` returned an error. The channel is considered broken.
+</ResponseField>
+
+<ResponseField name="Close" type="Arc<E>">
+  The transport's `poll_close` returned an error while closing the write half. The channel is considered broken.
+</ResponseField>
+
+### Matching on `ChannelError`
+
+```rust filename="src/client.rs"
+use tarpc::ChannelError;
+
+fn handle_channel_error(e: ChannelError<std::io::Error>) {
+    match e {
+        ChannelError::Read(src) => eprintln!("transport read failure: {src}"),
+        ChannelError::Ready(src) => eprintln!("transport not ready: {src}"),
+        ChannelError::Write(src) => eprintln!("transport write failure: {src}"),
+        ChannelError::Flush(src) => eprintln!("transport flush failure: {src}"),
+        ChannelError::Close(src) => eprintln!("transport close failure: {src}"),
+    }
+}
+```
+
+<Warning>
+`ChannelError` is not marked `#[non_exhaustive]`, but the `E` type parameter is `?Sized`, meaning you typically encounter it as `ChannelError<dyn std::error::Error + Send + Sync>` inside `RpcError::Channel`. Match with care if downcasting.
+</Warning>
+
+---
+
+## `RpcError`
+
+`RpcError` is the error type returned by every `Channel::call` invocation and by the generated client stub methods. It represents all cross-cutting failures that can occur at the RPC layer — not application-specific errors, which are conveyed inside a successful `Ok(Result<Resp, AppError>)` response.
+
+```rust filename="tarpc/src/client.rs"
+#[derive(thiserror::Error, Debug)]
+pub enum RpcError {
+    /// The client disconnected from the server.
+    #[error("the connection to the server was already shutdown")]
+    Shutdown,
+    /// The client failed to buffer the request in the underlying transport.
+    #[error("the client failed to buffer the request in the underlying transport")]
+    Send(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// The channel was disconnected due to a critical error.
+    #[error("the channel was disconnected due to a critical error")]
+    Channel(#[source] ChannelError<dyn std::error::Error + Send + Sync + 'static>),
+    /// The request exceeded its deadline.
+    #[error("the request exceeded its deadline")]
+    DeadlineExceeded,
+    /// The server aborted request processing.
+    #[error("the server aborted request processing")]
+    Server(#[from] ServerError),
+}
+```
+
+<ResponseField name="Shutdown" type="unit">
+  The dispatch task has already stopped, either because the transport's read half closed, the write half closed with no in-flight requests remaining, or a prior critical error caused the task to exit. No source error is attached. This variant is also returned when the `oneshot` receiver is cancelled because the dispatch task dropped it.
+</ResponseField>
+
+<ResponseField name="Send" type="Box<dyn Error + Send + Sync>">
+  The transport accepted readiness (`poll_ready` succeeded) but `start_send` failed for this specific request. Only the request that triggered the write error receives this variant; other in-flight requests continue normally. The boxed source is the raw transport error.
+</ResponseField>
+
+<ResponseField name="Channel" type="ChannelError<dyn Error + Send + Sync>">
+  A fatal transport error (read failure, flush failure, etc.) caused the entire channel to disconnect. All in-flight requests at the time of failure receive this variant simultaneously. The inner `ChannelError` identifies the transport operation that failed.
+</ResponseField>
+
+<ResponseField name="DeadlineExceeded" type="unit">
+  The request's deadline passed before a response was received. tarpc removes the request from the in-flight map locally; no cancellation message is sent to the server (the server knows its own deadline independently).
+</ResponseField>
+
+<ResponseField name="Server" type="ServerError">
+  The server handler returned `Err(ServerError)`. This is the only variant that carries application-level information. Use `#[from]` on the variant means a `ServerError` converts automatically into an `RpcError`.
+</ResponseField>
+
+### Handling `RpcError` in a Client
+
+```rust filename="src/client.rs"
+use tarpc::{client::RpcError, ServerError};
+use std::io;
+
+async fn call_service(client: &MyServiceClient) -> anyhow::Result<String> {
+    match client.do_work(tarpc::context::current(), "input".into()).await {
+        Ok(response) => Ok(response),
+        Err(RpcError::Server(ServerError { kind, detail })) => {
+            // Server explicitly rejected the request — handle per kind
+            match kind {
+                io::ErrorKind::PermissionDenied => {
+                    Err(anyhow::anyhow!("access denied: {detail}"))
+                }
+                io::ErrorKind::InvalidInput => {
+                    Err(anyhow::anyhow!("bad input: {detail}"))
+                }
+                _ => Err(anyhow::anyhow!("server error ({kind:?}): {detail}")),
+            }
+        }
+        Err(RpcError::DeadlineExceeded) => {
+            Err(anyhow::anyhow!("request timed out"))
+        }
+        Err(RpcError::Shutdown) => {
+            Err(anyhow::anyhow!("connection lost (shutdown)"))
+        }
+        Err(RpcError::Channel(e)) => {
+            Err(anyhow::anyhow!("transport error: {e}"))
+        }
+        Err(RpcError::Send(e)) => {
+            Err(anyhow::anyhow!("failed to send request: {e}"))
+        }
+    }
+}
+```
+
+<Warning>
+`RpcError` is not marked `#[non_exhaustive]` in the source, but it derives from `thiserror` and its variants have changed across minor releases (see the changelog). When matching exhaustively, consider whether a wildcard arm (`_ => ...`) would make your code more resilient to future additions.
+</Warning>
+
+### Converting `RpcError` to `anyhow::Error`
+
+`RpcError` implements `std::error::Error` and has a full source chain. The `Send` variant preserves the original transport error as its source, and `Channel` preserves the `ChannelError` as its source. These are both accessible via the standard `Error::source` chain, including via `anyhow`'s `.chain()` iterator:
+
+```rust filename="src/client.rs"
+let err: anyhow::Error = rpc_error.into();
+for cause in err.chain() {
+    eprintln!("caused by: {cause}");
+}
+```
+
+---
+
+## Summary
+
+| Type | Layer | Fatal? | Carries source? |
+|---|---|---|---|
+| `ServerError` | Application | No | No |
+| `ChannelError::Read` | Transport | Yes | `Arc<E>` |
+| `ChannelError::Ready` | Transport | Yes | `Arc<E>` |
+| `ChannelError::Write` | Transport | Per-request | `Arc<E>` |
+| `ChannelError::Flush` | Transport | Yes | `Arc<E>` |
+| `ChannelError::Close` | Transport | Yes | `Arc<E>` |
+| `RpcError::Shutdown` | Client dispatch | Yes | No |
+| `RpcError::Send` | Client dispatch | No | `Box<dyn Error>` |
+| `RpcError::Channel` | Client dispatch | Yes | `ChannelError<dyn Error>` |
+| `RpcError::DeadlineExceeded` | Client dispatch | No | No |
+| `RpcError::Server` | Server handler | No | `ServerError` |

@@ -1,0 +1,202 @@
+---
+sidebarTitle: "Client"
+title: "tarpc client setup: config, dispatch, and making RPC calls"
+description: "Understand the tarpc client model: Config fields, NewClient, Channel, the Stub trait, spawning dispatch, and handling RpcError in your application code."
+---
+
+The tarpc client model is built around a clear separation of concerns: a lightweight handle (`Channel`) that your application code uses to issue calls, and a background dispatch task (`RequestDispatch`) that manages the actual transport I/O. You obtain both by calling `YourServiceClient::new`, then either drive the dispatch manually or call `.spawn()` to hand it off to the Tokio runtime.
+
+## Client Configuration
+
+`client::Config` controls the resource limits of the client. Both fields have sensible defaults and the struct is `#[non_exhaustive]`, so create it with `Config::default()` and override only what you need.
+
+<ParamField path="max_in_flight_requests" type="usize" default="1000">
+  The maximum number of requests that can be simultaneously awaiting a response. When this limit is reached, subsequent calls will queue internally until an in-flight slot opens. It is safe to set this to `usize::MAX` if your own logic already bounds concurrency.
+</ParamField>
+
+<ParamField path="pending_request_buffer" type="usize" default="100">
+  The size of the in-process channel between the `Channel` handle and the dispatch task (measured in number of requests). A larger buffer improves throughput when the dispatch task is momentarily busy, because senders are less likely to wait. A background task continuously flushes buffered messages, so a high value does not cause messages to linger.
+</ParamField>
+
+```rust filename="src/main.rs"
+use tarpc::client;
+
+let config = client::Config {
+    max_in_flight_requests: 500,
+    pending_request_buffer: 50,
+    ..client::Config::default()
+};
+```
+
+## NewClient: Pairing a Handle with Dispatch
+
+`client::new` (and the generated `YourClient::new`) return a `NewClient<C, D>` value, which bundles:
+
+- **`client`** — the typed client handle (`WorldClient` or a raw `Channel<Req, Resp>`).
+- **`dispatch`** — the `RequestDispatch` future that drives the transport.
+
+```rust filename="src/main.rs"
+use tarpc::client::{self, NewClient};
+use tarpc::transport::channel;
+
+let (client_transport, server_transport) = channel::unbounded();
+
+let NewClient { client, dispatch } =
+    client::new(client::Config::default(), client_transport);
+
+// Drive dispatch manually, or use .spawn() below.
+tokio::spawn(dispatch);
+```
+
+### Spawning Dispatch with `.spawn()`
+
+When the `tokio1` Cargo feature is enabled, `NewClient` provides a convenience method that spawns the dispatch on the current Tokio runtime and returns only the client handle:
+
+```rust filename="src/main.rs"
+// Requires the `tokio1` feature.
+let client = WorldClient::new(client::Config::default(), client_transport).spawn();
+```
+
+If the dispatch future encounters a transport error, it logs a warning via `tracing` and exits gracefully — it does not panic.
+
+## The Channel Type
+
+`client::Channel<Req, Resp>` is the low-level handle that the generated `YourClient` wraps. It is `Clone`, so you can share it across tasks by cloning:
+
+```rust filename="src/main.rs"
+// WorldClient wraps Channel internally and is also Clone.
+let client2 = client.clone();
+tokio::spawn(async move {
+    let _ = client2.hello(context::current(), "Bob".to_string()).await;
+});
+```
+
+Under the hood, `Channel` sends each call as a `DispatchRequest` over an in-process `mpsc` channel to the running `RequestDispatch`. A `ResponseGuard` on the caller side ensures that dropping the returned `Future` before it resolves automatically sends a cancellation message to the server.
+
+## Making RPC Calls
+
+Every generated client method follows the same signature: `&self`, then `context::Context`, then the declared RPC arguments. Always pass `context::current()` as the context unless you need a custom deadline or trace:
+
+```rust filename="src/main.rs"
+use tarpc::context;
+
+let greeting: String = client
+    .hello(context::current(), "Alice".to_string())
+    .await?;
+```
+
+Each call returns `impl Future<Output = Result<ReturnType, RpcError>>`. Calls to the same client can run concurrently — each call is independently tracked by the dispatch task.
+
+## The Stub Trait
+
+`client::stub::Stub` is a trait that abstracts over anything that can service RPC calls. `Channel` implements it, and so does any `Serve` implementor (for in-process testing without a transport):
+
+```rust filename="src/stub.rs"
+pub trait Stub {
+    type Req: RequestName;
+    type Resp;
+
+    async fn call(
+        &self,
+        ctx: context::Context,
+        request: Self::Req,
+    ) -> Result<Self::Resp, RpcError>;
+}
+```
+
+The generated `WorldClient<Stub>` is generic over any type implementing `Stub<Req = WorldRequest, Resp = WorldResponse>`. This means you can swap in a mock, a load-balancer, or a retry wrapper without changing the call sites.
+
+## RpcError Variants
+
+All client call failures are returned as `client::RpcError`:
+
+<Accordion title="RpcError variants">
+
+| Variant | Meaning |
+|---------|---------|
+| `RpcError::Shutdown` | The connection to the server was already shut down before or during the call. |
+| `RpcError::Send(source)` | The client failed to buffer the request in the underlying transport. The `source` carries the transport error. |
+| `RpcError::Channel(source)` | A critical transport error disconnected the channel (read, write, flush, or close failure). |
+| `RpcError::DeadlineExceeded` | The request deadline passed before a response arrived. The dispatch task clears the in-flight slot and returns this error. |
+| `RpcError::Server(ServerError)` | The server explicitly aborted the request (e.g., due to throttling). The inner `ServerError` carries an `io::ErrorKind` and a detail string. |
+
+</Accordion>
+
+```rust filename="src/main.rs"
+use tarpc::client::RpcError;
+
+match client.hello(context::current(), "Alice".to_string()).await {
+    Ok(greeting) => println!("{greeting}"),
+    Err(RpcError::DeadlineExceeded) => eprintln!("request timed out"),
+    Err(RpcError::Server(e)) => eprintln!("server error: {e}"),
+    Err(e) => eprintln!("transport error: {e}"),
+}
+```
+
+## Complete Client Setup Example
+
+<Steps>
+
+### Add Dependencies
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc   = { version = "0.37", features = ["tokio1"] }
+tokio   = { version = "1.0",  features = ["macros", "rt-multi-thread"] }
+futures = "0.3"
+anyhow  = "1.0"
+```
+
+### Define and Implement the Service
+
+```rust filename="src/main.rs"
+use tarpc::{client, context, server::{self, Channel}};
+use futures::prelude::*;
+
+#[tarpc::service]
+pub trait Calculator {
+    async fn add(a: i32, b: i32) -> i32;
+}
+
+#[derive(Clone)]
+struct CalcServer;
+
+impl Calculator for CalcServer {
+    async fn add(self, _ctx: context::Context, a: i32, b: i32) -> i32 {
+        a + b
+    }
+}
+```
+
+### Connect Client and Server
+
+```rust filename="src/main.rs"
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let (client_transport, server_transport) =
+        tarpc::transport::channel::unbounded();
+
+    // Start server
+    let server = server::BaseChannel::with_defaults(server_transport);
+    tokio::spawn(
+        server
+            .execute(CalcServer.serve())
+            .for_each(|resp| async move { tokio::spawn(resp); }),
+    );
+
+    // Build and spawn client
+    let client = CalculatorClient::new(
+        client::Config::default(),
+        client_transport,
+    )
+    .spawn(); // requires tokio1 feature
+
+    // Make an RPC call
+    let result = client.add(context::current(), 3, 4).await?;
+    println!("3 + 4 = {result}"); // prints: 3 + 4 = 7
+
+    Ok(())
+}
+```
+
+</Steps>

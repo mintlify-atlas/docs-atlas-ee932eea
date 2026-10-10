@@ -1,0 +1,239 @@
+---
+title: "tarpc Cargo feature flags reference"
+sidebarTitle: "Cargo Features"
+description: "Complete reference for all tarpc Cargo feature flags, their dependencies, and common combinations for network transports and serialization."
+---
+
+tarpc ships with a minimal default feature set — the core request/response machinery compiles with no optional dependencies. Every additional capability (Serde serialization, Tokio integration, TCP/Unix transports) is opt-in through Cargo feature flags. This page describes every feature declared in `tarpc/Cargo.toml`, its exact dependency tree, and the scenarios where you'd reach for each one.
+
+## Feature Overview
+
+| Feature | Enables | Depends On |
+|---|---|---|
+| `serde1` | Serde derives on request/response types | `serde`, `tarpc-plugins/serde1` |
+| `tokio1` | `NewClient::spawn()` helper | `tokio/rt` |
+| `serde-transport` | Generic framed codec transport | `serde1`, `tokio1`, `tokio-serde`, `tokio-util/codec` |
+| `serde-transport-json` | JSON codec for `serde_transport` | `serde-transport`, `tokio-serde/json` |
+| `serde-transport-bincode` | Bincode codec for `serde_transport` | `serde-transport`, `tokio-serde/bincode` |
+| `tcp` | `serde_transport::tcp` module | `tokio/net` |
+| `unix` | `serde_transport::unix` module | `tokio/net` |
+| `full` | All of the above | everything |
+
+## Individual Features
+
+### `serde1`
+
+Enables [Serde](https://serde.rs/) `Serialize` and `Deserialize` derives on tarpc's core types — `Request`, `Response`, `ClientMessage`, `ServerError`, and `context::Context`. Without this feature those types carry no serialization impls and tarpc is usable only with in-process transports.
+
+```toml filename="Cargo.toml"
+[features]
+serde1 = ["tarpc-plugins/serde1", "serde", "serde/derive", "serde/rc"]
+```
+
+Add to your project:
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["serde1"] }
+```
+
+<Note>
+`serde1` alone is sufficient for custom transports that do their own serialization. You don't need `serde-transport` unless you want the built-in framed codec layer.
+</Note>
+
+---
+
+### `tokio1`
+
+Enables the `NewClient::spawn()` convenience method, which spawns the client dispatch task on the Tokio runtime and returns only the `Channel` handle.
+
+```toml filename="Cargo.toml"
+[features]
+tokio1 = ["tokio/rt"]
+```
+
+Without this feature you must drive the dispatch future manually:
+
+```rust
+// Without tokio1: drive dispatch yourself
+let NewClient { client, dispatch } = client::new(config, transport);
+tokio::spawn(dispatch); // requires tokio, but not the feature
+```
+
+With `tokio1` enabled:
+
+```rust
+// With tokio1: one-liner setup
+let client = client::new(config, transport).spawn();
+```
+
+<Tip>
+`tokio1` only adds `tokio/rt` — the runtime executor. The `time` feature of Tokio is always enabled unconditionally by tarpc (for deadline handling), so enabling `tokio1` does not significantly increase compile time.
+</Tip>
+
+---
+
+### `serde-transport`
+
+Enables `tarpc::serde_transport`, a generic framed-codec transport built on `tokio-serde` and `tokio-util`. This is the primary building block for real network transports in tarpc and pulls in `serde1` and `tokio1` automatically.
+
+```toml filename="Cargo.toml"
+[features]
+serde-transport = ["serde1", "tokio1", "tokio-serde", "tokio-util/codec"]
+```
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["serde-transport"] }
+```
+
+When `serde-transport` is active, tarpc re-exports both `tokio_serde` and `tokio_util` so your code can reference them through `tarpc::tokio_serde` and `tarpc::tokio_util`.
+
+---
+
+### `serde-transport-json`
+
+Adds a JSON codec to `serde_transport`. Useful for debugging and interoperability with non-Rust clients. Requires `serde-transport`.
+
+```toml filename="Cargo.toml"
+[features]
+serde-transport-json = ["serde-transport", "tokio-serde/json"]
+```
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["serde-transport-json", "tcp"] }
+serde = { version = "1", features = ["derive"] }
+```
+
+---
+
+### `serde-transport-bincode`
+
+Adds a [Bincode](https://github.com/bincode-org/bincode) codec to `serde_transport`. Bincode is a compact binary format well suited for high-throughput internal services where payload size matters.
+
+```toml filename="Cargo.toml"
+[features]
+serde-transport-bincode = ["serde-transport", "tokio-serde/bincode"]
+```
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["serde-transport-bincode", "tcp"] }
+bincode = { version = "2.0", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+```
+
+---
+
+### `tcp`
+
+Enables `tarpc::serde_transport::tcp`, which provides `connect` and `listen` helpers for TCP connections. Note that `tcp` does **not** automatically enable `serde-transport` — you must list both if you want the full TCP transport stack.
+
+```toml filename="Cargo.toml"
+[features]
+tcp = ["tokio/net"]
+```
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["serde-transport-json", "tcp"] }
+```
+
+---
+
+### `unix`
+
+Enables `tarpc::serde_transport::unix` for Unix Domain Socket (UDS) transports. Like `tcp`, this only adds `tokio/net` and must be combined with a codec feature.
+
+```toml filename="Cargo.toml"
+[features]
+unix = ["tokio/net"]
+```
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["serde-transport-bincode", "unix"] }
+```
+
+<Note>
+Unix Domain Sockets are only available on Unix-like platforms. Using the `unix` feature on Windows will fail to compile.
+</Note>
+
+---
+
+### `full`
+
+Enables every feature listed above. Useful during development or in examples.
+
+```toml filename="Cargo.toml"
+[features]
+full = [
+    "serde1",
+    "tokio1",
+    "serde-transport",
+    "serde-transport-json",
+    "serde-transport-bincode",
+    "tcp",
+    "unix",
+]
+```
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["full"] }
+```
+
+<Warning>
+Do not use `full` in published libraries. Depend only on the specific features your library actually needs so that downstream users can minimise their compile surface.
+</Warning>
+
+## Common Combinations
+
+### In-process testing (no network, no serialization)
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["tokio1"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+Use `tarpc::transport::channel::unbounded()` to connect a client and server in the same process.
+
+### TCP service with JSON (development / debugging)
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["serde-transport-json", "tcp", "tokio1"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+### TCP service with Bincode (production)
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["serde-transport-bincode", "tcp", "tokio1"] }
+bincode = { version = "2.0", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+### Unix socket service with Bincode
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["serde-transport-bincode", "unix", "tokio1"] }
+bincode = { version = "2.0", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+### Custom transport (e.g. compressed or TLS)
+
+When implementing a custom transport you only need serialization and tokio integration, not the built-in codec layer:
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = { version = "0.38", features = ["serde1", "tokio1", "serde-transport"] }
+```

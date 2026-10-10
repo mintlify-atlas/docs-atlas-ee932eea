@@ -1,0 +1,189 @@
+---
+sidebarTitle: "Context & Deadlines"
+title: "Request context, deadlines, and distributed tracing in tarpc"
+description: "Understand how tarpc's Context propagates deadlines and trace IDs across services, how cascading deadlines work, and how to set custom request timeouts."
+---
+
+Every tarpc RPC carries a `context::Context` value from the moment it leaves the client to the moment the server finishes handling it. The context has two jobs: enforcing a deadline that limits how long the server is allowed to work on the request, and propagating a distributed trace ID so that related events across multiple services can be correlated. Understanding how `Context` works lets you reason about timeouts, cancellations, and observability in any tarpc-based system.
+
+## The Context Struct
+
+`context::Context` is a small `Copy` value defined in `tarpc::context`:
+
+```rust filename="tarpc/src/context.rs (abridged)"
+#[derive(Clone, Copy, Debug)]
+pub struct Context {
+    /// When the client expects the request to complete by.
+    pub deadline: std::time::Instant,
+
+    /// Trace information linking this request to related actions.
+    pub trace_context: trace::Context,
+}
+```
+
+Both fields are `pub`, so handlers can read them directly. The struct is `#[non_exhaustive]`, meaning new fields may be added in future versions without breaking existing code.
+
+### The `deadline` Field
+
+`deadline` is a `std::time::Instant`. The server automatically cancels the request handler future when `Instant::now()` passes this value — there is no manual timer management required. The default deadline is **10 seconds from the time the context is created**, set by `context::current()`.
+
+### The `trace_context` Field
+
+`trace_context` is a `trace::Context` containing a `trace_id` (128-bit UUID), a `span_id` (64-bit identifier), and a `sampling_decision`. These values are compatible with OpenTelemetry spans and are used by the `tracing` instrumentation built into the tarpc client and server.
+
+## Obtaining a Context: `context::current()`
+
+```rust filename="src/client.rs"
+use tarpc::context;
+
+// Returns Context with a 10-second deadline and the trace info
+// from the current tracing::Span (if any).
+let ctx = context::current();
+```
+
+`context::current()` reads the deadline and trace context from the currently active `tracing::Span`. If no span is active (or no OpenTelemetry subscriber is installed), it uses a fresh trace context and a 10-second deadline. This makes it safe to call from anywhere — at the top level of `main`, inside a handler, or in a test.
+
+## Using Context in Handlers
+
+Every generated service method receives the client's context as its second argument, after `self`:
+
+```rust filename="src/server.rs"
+use tarpc::context;
+
+impl World for HelloServer {
+    async fn hello(self, ctx: context::Context, name: String) -> String {
+        // Read the trace ID for logging.
+        let trace_id = ctx.trace_id();
+        tracing::info!(%trace_id, "handling hello request");
+
+        // Read the remaining time until deadline.
+        let remaining = ctx.deadline.duration_since(std::time::Instant::now());
+        tracing::debug!(?remaining, "deadline remaining");
+
+        format!("Hello, {name}!")
+    }
+}
+```
+
+### Reading the Trace ID
+
+`Context` provides a convenience method that returns a reference to the `trace_id` without needing to navigate the `trace_context` field:
+
+```rust filename="src/server.rs"
+let trace_id: &tarpc::trace::TraceId = ctx.trace_id();
+```
+
+<Note>
+  Do not store `Context` in your server struct across multiple requests — the context is different for each request, and it will have the wrong deadline and trace ID if reused.
+</Note>
+
+## Deadline Propagation Across Chained Services
+
+One of tarpc's most powerful features is automatic deadline propagation. When a server that is handling a request makes an outbound RPC of its own using `context::current()`, the outbound call's deadline is derived from the current span's deadline — which was set by the inbound request's context. The client does not start a fresh 10-second clock; instead it uses whatever time is left on the original deadline.
+
+Consider a three-service chain: **Gateway → Backend → Database**.
+
+```
+Client calls Gateway with a 10-second deadline.
+  │
+  └─ Gateway does 2 seconds of work.
+       │
+       └─ Gateway calls Backend using context::current().
+            Backend sees an 8-second deadline (10s − 2s elapsed).
+            │
+            └─ Backend does 3 seconds of work.
+                 │
+                 └─ Backend calls Database using context::current().
+                      Database sees a 5-second deadline (8s − 3s elapsed).
+```
+
+This cascade happens automatically because `context::current()` reads the deadline that was injected into the active `tracing::Span` when the server began handling the inbound request.
+
+```rust filename="src/gateway.rs"
+impl Gateway for GatewayServer {
+    async fn fetch_page(self, _ctx: context::Context, url: String) -> String {
+        // Do some local work…
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Call another service. context::current() picks up the remaining
+        // deadline from the inbound request's span.
+        let data = backend_client
+            .get_data(context::current(), url)
+            .await
+            .unwrap_or_default();
+
+        format!("<html>{data}</html>")
+    }
+}
+```
+
+<Tip>
+  Always use `context::current()` — not the `ctx` parameter you received — when making outbound calls from inside a handler. `context::current()` reads the span-embedded deadline, which reflects elapsed time. Forwarding the received `ctx.deadline` directly would not account for time already spent in the current handler.
+</Tip>
+
+## Creating Custom Contexts
+
+To set a deadline different from the default 10 seconds, construct a `Context` manually:
+
+```rust filename="src/client.rs"
+use std::time::{Duration, Instant};
+use tarpc::context;
+
+// Create a context with a 30-second deadline.
+let mut ctx = context::current();
+ctx.deadline = Instant::now() + Duration::from_secs(30);
+
+let result = client.expensive_operation(ctx, input).await?;
+```
+
+To use a very long-running or fire-and-forget deadline:
+
+```rust filename="src/client.rs"
+use std::time::{Duration, Instant};
+use tarpc::context;
+
+let mut ctx = context::current();
+// Ten-minute deadline for a batch job.
+ctx.deadline = Instant::now() + Duration::from_secs(600);
+
+client.run_batch_job(ctx, params).await?;
+```
+
+## Serde Serialization of Deadlines
+
+When requests are sent over a network transport (e.g., TCP), the `Context` must be serialized. `Instant` is not an absolute point in calendar time — it is a monotonic clock value relative to the local machine. Sending a raw `Instant` across the network would produce meaningless results on the receiver.
+
+tarpc solves this with a custom serde implementation: when **serializing**, the deadline is converted to a `Duration` representing time remaining from `Instant::now()`. When **deserializing**, that `Duration` is added to the receiver's `Instant::now()` to reconstruct an absolute deadline in the receiver's clock:
+
+```rust filename="tarpc/src/context.rs (abridged)"
+// serialize: deadline → duration remaining
+let deadline = deadline.duration_since(Instant::now());
+deadline.serialize(serializer)
+
+// deserialize: duration remaining → new Instant
+let deadline = Duration::deserialize(deserializer)?;
+Ok(Instant::now() + deadline)
+```
+
+This approach naturally accounts for clock skew: even if the client and server clocks differ, the deadline is always expressed as _time remaining_, not as an absolute timestamp.
+
+<Note>
+  Small amounts of network latency will reduce the effective deadline on the server side (time spent in transit is time not spent on processing). This is expected and desirable — it prevents servers from doing work that the client's deadline would deem too late to be useful.
+</Note>
+
+## Context Summary
+
+<CardGroup cols={2}>
+  <Card title="Default deadline" icon="clock">
+    10 seconds from the moment `context::current()` is called. Configured via `ten_seconds_from_now()` internally.
+  </Card>
+  <Card title="Automatic cancellation" icon="circle-stop">
+    The server aborts the handler future when the deadline is exceeded. No manual timeout code needed.
+  </Card>
+  <Card title="Cascading deadlines" icon="arrow-right">
+    Using `context::current()` in outbound calls within a handler automatically propagates the remaining deadline.
+  </Card>
+  <Card title="Serde safety" icon="arrows-rotate">
+    Deadlines are serialized as relative durations to avoid clock-skew issues across network boundaries.
+  </Card>
+</CardGroup>

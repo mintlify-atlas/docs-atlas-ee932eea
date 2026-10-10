@@ -1,0 +1,72 @@
+---
+title: "tarpc: Async RPC Framework for Rust — Introduction"
+sidebarTitle: "Introduction"
+description: "tarpc is an async RPC framework for Rust that defines services in code—no .proto files, no code generation step, no context switching between languages."
+---
+
+tarpc is an RPC framework for Rust with a focus on ease of use. Defining a service takes just a few lines of code, and most of the boilerplate of writing a server is handled for you. This page covers what tarpc is, the problems it solves, how it differs from other RPC frameworks, and a summary of its key features.
+
+<Note>
+  tarpc is **not** an official Google product. It is an open-source project
+  maintained on GitHub at [google/tarpc](https://github.com/google/tarpc) and
+  published under the MIT license.
+</Note>
+
+## What is RPC?
+
+"RPC" stands for **Remote Procedure Call** — a function call where the work of producing the return value is done somewhere else. When an RPC function is invoked, it contacts another process and asks it to evaluate the function instead. The original caller then receives the value produced by the remote process.
+
+RPC frameworks are a fundamental building block of most microservices-oriented architectures. Two well-known ones are [gRPC](https://grpc.io) and [Cap'n Proto](https://capnproto.org).
+
+## How tarpc differs from gRPC and Protobuf
+
+The most significant difference between tarpc and frameworks like gRPC is where the service schema lives.
+
+| | tarpc | gRPC / Protobuf |
+|---|---|---|
+| **Schema language** | Rust traits | `.proto` files (a separate DSL) |
+| **Code generation** | `#[tarpc::service]` proc macro, compiled with your crate | Separate `protoc` compilation step |
+| **Language switching** | None — everything is Rust | Switch between `.proto` and implementation language |
+| **Type system** | Native Rust types, checked by `rustc` | Protobuf types mapped to language types |
+| **Serialization** | Optional — in-process channels need none | Required — always serializes on the wire |
+
+With tarpc, you define a service as a Rust trait annotated with `#[tarpc::service]`. The proc macro expands it into all the client and server boilerplate you need. Because the schema is just Rust code, you get the full power of `rustdoc`, `rustc` error messages, and native Rust types without any extra tooling.
+
+## Key features
+
+### Pluggable transport
+
+Any type that implements `Stream<Item = Request> + Sink<Response>` can be used as a transport to connect a client and server. tarpc ships an in-process channel for testing and single-binary use, as well as a generic `serde_transport` (behind the `serde-transport` feature) with TCP and Unix Domain Socket support.
+
+### `Send + 'static` optional
+
+If the transport you choose doesn't require `Send + 'static`, tarpc doesn't either. In-process channels, for example, have no such requirement.
+
+### Cascading cancellation
+
+Dropping a request future automatically sends a cancellation message to the server. The server ceases any unfinished work on that request and recursively cancels any downstream requests it had initiated — propagating cancellation through the entire call chain.
+
+### Deadline propagation
+
+Request deadlines default to **10 seconds** if unspecified. The server automatically stops processing a request once its deadline has passed. Any requests a server sends using the incoming request context automatically inherit a shortened deadline. For example, if a server receives a request with a 10 s deadline and spends 2 s on local work before calling another service, that downstream service sees an 8 s deadline.
+
+### Distributed tracing
+
+tarpc is instrumented with [tracing](https://github.com/tokio-rs/tracing) primitives extended with [OpenTelemetry](https://opentelemetry.io/) traces. Using a compatible exporter (such as OTLP/Jaeger), each RPC can be traced through the client, server, and all downstream dependencies. Even without a distributed tracing collector, the instrumentation integrates with standard loggers like [env_logger](https://github.com/env-logger-rs/env_logger).
+
+### Serde serialization
+
+Enabling the `serde1` Cargo feature makes all service request and response types `Serialize + Deserialize`. Serialization is entirely opt-in — in-process transports work without it, so you only pay the cost of serialization when you actually need it.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build and run your first tarpc service end-to-end in minutes using an
+    in-process channel.
+  </Card>
+  <Card title="Installation" icon="box" href="/installation">
+    Learn about all available Cargo features and how to configure tarpc for
+    your specific use case.
+  </Card>
+</CardGroup>

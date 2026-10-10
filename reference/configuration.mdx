@@ -1,0 +1,162 @@
+---
+title: "tarpc client and server configuration options"
+sidebarTitle: "Configuration"
+description: "Reference for client::Config and server::Config structs, their fields, defaults, and how to customise them for throughput and resource tuning."
+---
+
+tarpc exposes two configuration structs — `client::Config` and `server::Config` — that let you tune resource limits and buffer sizes without touching transport or service code. Both structs implement `Default` so you can start with sensible values and override only what you need using Rust's struct update syntax.
+
+## `client::Config`
+
+`client::Config` controls how the client-side dispatch task manages outstanding requests and its internal send buffer. It is passed to `client::new` (or the generated `Client::new` stub constructor) when creating a new client channel.
+
+```rust filename="src/main.rs"
+use tarpc::client;
+
+let config = client::Config {
+    max_in_flight_requests: 500,
+    pending_request_buffer: 50,
+    ..client::Config::default()
+};
+```
+
+The struct is marked `#[non_exhaustive]`, so you must always supply `..client::Config::default()` when constructing it with a literal to remain forward-compatible with future fields.
+
+---
+
+<ParamField path="max_in_flight_requests" type="usize" default="1000">
+  The maximum number of requests that can be awaiting a response at the same time. When this limit is reached, subsequent `call` invocations will queue internally rather than be sent over the transport immediately, and the dispatch task will not send new requests until existing ones complete.
+
+  It is safe to set this to a very large value such as `usize::MAX` if your application logic already bounds concurrency at a higher level. The parameter exists to provide a backstop against unbounded memory growth in the event of a server that is slow or unresponsive.
+</ParamField>
+
+<ParamField path="pending_request_buffer" type="usize" default="100">
+  The capacity of the in-process MPSC channel between the `Channel::call` API and the background dispatch task that writes requests to the network. This controls how many requests can be buffered in memory before back-pressure propagates to callers.
+
+  Setting this too low may decrease throughput by stalling callers before the transport is actually full. Setting it high does not block sending — a background task continuously flushes any buffered messages to the transport.
+</ParamField>
+
+### Full Example — Custom `client::Config`
+
+```rust filename="src/main.rs"
+use tarpc::{client, context, transport};
+
+#[tarpc::service]
+trait Adder {
+    async fn add(a: i32, b: i32) -> i32;
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let (client_transport, server_transport) = transport::channel::unbounded();
+
+    // Tune for a low-concurrency environment
+    let config = client::Config {
+        max_in_flight_requests: 50,
+        pending_request_buffer: 10,
+        ..client::Config::default()
+    };
+
+    // Pass config to the generated client constructor
+    let client = AdderClient::new(config, client_transport).spawn();
+
+    let result = client.add(context::current(), 1, 2).await?;
+    println!("{result}");
+    Ok(())
+}
+```
+
+---
+
+## `server::Config`
+
+`server::Config` controls a single buffer that sits between a channel's request handlers and the outbound response writer. It is passed to `BaseChannel::new` when accepting a connection, or applied via `Config::channel`.
+
+```rust filename="src/main.rs"
+use tarpc::server;
+
+let config = server::Config {
+    pending_response_buffer: 200,
+};
+```
+
+Unlike `client::Config`, `server::Config` is **not** marked `#[non_exhaustive]`, so you can construct it without the spread syntax if you wish.
+
+---
+
+<ParamField path="pending_response_buffer" type="usize" default="100">
+  Controls the buffer size (in number of responses) of the in-process MPSC channel over which request handlers send completed responses back to the `Channel` for writing to the wire. In other words, this is the number of responses that can be queued for transmission before request handlers begin applying back-pressure.
+
+  Increase this value if your handlers produce responses faster than the network can consume them and you want to reduce handler stalls. Decrease it to apply tighter memory bounds on a heavily loaded server.
+</ParamField>
+
+### Full Example — Custom `server::Config`
+
+```rust filename="src/main.rs"
+use tarpc::{
+    client, context, server,
+    server::{BaseChannel, Channel},
+    transport,
+};
+use futures::prelude::*;
+
+#[tarpc::service]
+trait Adder {
+    async fn add(a: i32, b: i32) -> i32;
+}
+
+#[derive(Clone)]
+struct AdderServer;
+
+impl Adder for AdderServer {
+    async fn add(self, _ctx: context::Context, a: i32, b: i32) -> i32 {
+        a + b
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let (client_transport, server_transport) = transport::channel::unbounded();
+
+    // Increase response buffer for a high-throughput server
+    let server_config = server::Config {
+        pending_response_buffer: 500,
+    };
+
+    let channel = BaseChannel::new(server_config, server_transport);
+    tokio::spawn(
+        channel
+            .execute(AdderServer.serve())
+            .for_each(|rpc| async move { tokio::spawn(rpc); }),
+    );
+
+    let client = AdderClient::new(client::Config::default(), client_transport).spawn();
+    assert_eq!(client.add(context::current(), 3, 4).await.unwrap(), 7);
+}
+```
+
+### Using `Config::channel`
+
+`server::Config` also exposes a convenience method `channel` that creates a `BaseChannel` directly:
+
+```rust filename="src/main.rs"
+use tarpc::server;
+
+let config = server::Config { pending_response_buffer: 200 };
+// Equivalent to BaseChannel::new(config, transport)
+let channel = config.channel(transport);
+```
+
+---
+
+## Default Summary
+
+| Struct | Field | Default |
+|---|---|---|
+| `client::Config` | `max_in_flight_requests` | `1000` |
+| `client::Config` | `pending_request_buffer` | `100` |
+| `server::Config` | `pending_response_buffer` | `100` |
+
+<Tip>
+When benchmarking, start with the defaults and increase `max_in_flight_requests` first. Only tune `pending_request_buffer` and `pending_response_buffer` if profiling shows those channels becoming a bottleneck.
+</Tip>

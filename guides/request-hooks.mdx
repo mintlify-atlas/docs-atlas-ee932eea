@@ -1,0 +1,243 @@
+---
+sidebarTitle: "Request Hooks"
+title: "Add request hooks for cross-cutting server concerns"
+description: "Use tarpc's BeforeRequest and AfterRequest traits to intercept every request for deadline enforcement, structured logging, and metrics."
+---
+
+tarpc provides a composable hook system that lets you intercept requests before they are dispatched to your handler, after they complete, or both. This is the idiomatic place to implement cross-cutting concerns such as deadline capping, structured logging, latency recording, and per-request rate limiting — all without modifying individual handler implementations.
+
+## The `RequestHook` extension trait
+
+`RequestHook` is automatically implemented for every type that implements `Serve`. It adds three methods:
+
+| Method | When it runs | Can fail the request? |
+|---|---|---|
+| `.before(hook)` | Before the handler | Yes — returning `Err(ServerError)` short-circuits the handler |
+| `.after(hook)` | After the handler | No — receives `&mut Result<Resp, ServerError>` |
+| `.before_and_after(hook)` | Both | Yes (before phase) |
+
+All three methods accept either a closure or a struct that implements the corresponding trait.
+
+## `BeforeRequest` — running logic before a handler
+
+Any type that implements `FnMut(&mut Context, &Req) -> impl Future<Output = Result<(), ServerError>>` satisfies `BeforeRequest<Req>` automatically.
+
+```rust filename="src/server.rs"
+use tarpc::{
+    context, ServerError,
+    server::{serve, request_hook::RequestHook},
+};
+use std::io;
+
+// Closure form: reject request type 1 entirely
+let handler = serve(|_ctx, i| async move { Ok(i + 1) })
+    .before(|_ctx: &mut context::Context, req: &i32| {
+        futures::future::ready(if *req == 1 {
+            Err(ServerError::new(
+                io::ErrorKind::Other,
+                format!("I don't like {req}"),
+            ))
+        } else {
+            Ok(())
+        })
+    });
+```
+
+### Struct form and deadline enforcement
+
+Implement `BeforeRequest` on your own type when you need state:
+
+```rust filename="src/hooks.rs"
+use tarpc::{context, ServerError, server::request_hook::BeforeRequest};
+use std::time::{Duration, SystemTime};
+
+/// Caps the deadline on every incoming request.
+#[derive(Clone)]
+struct MaxDeadline(Duration);
+
+impl<Req> BeforeRequest<Req> for MaxDeadline {
+    async fn before(
+        &mut self,
+        ctx: &mut context::Context,
+        _req: &Req,
+    ) -> Result<(), ServerError> {
+        let max = SystemTime::now() + self.0;
+        if ctx.deadline > max {
+            ctx.deadline = max;
+        }
+        Ok(())
+    }
+}
+```
+
+Apply it to any server:
+
+```rust filename="src/server.rs"
+let handler = MyService.serve().before(MaxDeadline(Duration::from_secs(5)));
+```
+
+## `AfterRequest` — running logic after a handler
+
+`AfterRequest` receives a mutable reference to the response so the hook can inspect or rewrite it. Closure form:
+
+```rust filename="src/server.rs"
+use tarpc::{
+    context, ServerError,
+    server::{serve, request_hook::RequestHook},
+};
+
+let handler = serve(|_ctx, i: i32| async move {
+    if i == 1 {
+        Err(ServerError::new(
+            std::io::ErrorKind::Other,
+            "1 is the loneliest number".into(),
+        ))
+    } else {
+        Ok(i + 1)
+    }
+})
+.after(|_ctx: &mut context::Context, resp: &mut Result<i32, ServerError>| {
+    if let Err(e) = resp {
+        eprintln!("server error: {e:?}");
+    }
+    futures::future::ready(())
+});
+```
+
+## `before_and_after` — a single hook for both phases
+
+When you need to measure latency or correlate state across request lifecycle phases, implement both `BeforeRequest` and `AfterRequest` on the same struct and use `.before_and_after()`:
+
+```rust filename="src/hooks.rs"
+use std::time::Instant;
+use tarpc::{
+    context, ServerError,
+    server::request_hook::{AfterRequest, BeforeRequest},
+};
+
+struct PrintLatency(Instant);
+
+impl<Req> BeforeRequest<Req> for PrintLatency {
+    async fn before(
+        &mut self,
+        _ctx: &mut context::Context,
+        _req: &Req,
+    ) -> Result<(), ServerError> {
+        self.0 = Instant::now();
+        Ok(())
+    }
+}
+
+impl<Resp> AfterRequest<Resp> for PrintLatency {
+    async fn after(
+        &mut self,
+        _ctx: &mut context::Context,
+        _resp: &mut Result<Resp, ServerError>,
+    ) {
+        tracing::info!(elapsed = ?self.0.elapsed(), "request completed");
+    }
+}
+```
+
+```rust filename="src/server.rs"
+let handler = MyService
+    .serve()
+    .before_and_after(PrintLatency(Instant::now()));
+```
+
+## Composing multiple `before` hooks with `BeforeRequestList`
+
+When you want to chain several independent before-hooks, use `request_hook::before()` to start a builder and chain `.then_fn()` calls. Hooks run in declaration order; the first error short-circuits the rest.
+
+```rust filename="src/server.rs"
+use tarpc::server::{serve, request_hook::{self, BeforeRequestList}};
+use std::cell::Cell;
+
+let i = Cell::new(0u32);
+
+let handler = request_hook::before()
+    .then_fn(|_ctx, _req| async {
+        // first hook
+        Ok(())
+    })
+    .then_fn(move |ctx: &mut tarpc::context::Context, _req| async move {
+        // second hook — cap the deadline
+        let max = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        if ctx.deadline > max {
+            ctx.deadline = max;
+        }
+        Ok(())
+    })
+    .serving(serve(|_ctx, i: i32| async move { Ok(i + 1) }));
+```
+
+<Tip>
+`BeforeRequestList::then_fn` is syntactic sugar for `then` when the next hook is a closure. It helps the compiler infer the closure's types without an explicit annotation.
+</Tip>
+
+### The `BeforeRequestList` types
+
+| Type | Role |
+|---|---|
+| `BeforeRequestNil` | The empty starting point returned by `request_hook::before()` |
+| `BeforeRequestCons<First, Rest>` | A cons-cell that chains `First` before `Rest` |
+| `HookThenServe<Serv, Hook>` | The resulting `Serve` wrapper produced by `.serving()` or `.before()` |
+
+## Real-world pattern: request logging with the tracing example
+
+The tarpc `tracing` example chains a `before` hook on the `AddServer` to simulate intermittent failures (gamma-ray bit flips), demonstrating that hooks can perform async work and produce `ServerError` to abort requests:
+
+```rust filename="examples/tracing.rs (excerpt)"
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use tarpc::{
+    ServerError,
+    server::{BaseChannel, incoming::{Incoming, spawn_incoming}, request_hook::{self, BeforeRequestList}},
+};
+
+let something_bad_happened = Arc::new(AtomicBool::new(false));
+
+let server = request_hook::before()
+    .then_fn(move |_ctx, _req| {
+        let flag = something_bad_happened.clone();
+        async move {
+            if flag.fetch_xor(true, Ordering::Relaxed) {
+                Err(ServerError::new(
+                    std::io::ErrorKind::NotFound,
+                    "Gamma Ray!".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    })
+    .serving(AddServer.serve());
+
+let channels = add_listener
+    .map(BaseChannel::with_defaults);
+tokio::spawn(spawn_incoming(channels.execute(server)));
+```
+
+<Note>
+Hooks are cloned for every request because `Serve` requires `Clone`. Make sure any state shared across requests (like `AtomicBool` above) is wrapped in an `Arc`.
+</Note>
+
+## Summary
+
+```rust filename="quick reference"
+use tarpc::server::request_hook::{self, BeforeRequestList, RequestHook};
+
+// Single before hook
+serve.before(my_before_hook);
+
+// Single after hook  
+serve.after(my_after_hook);
+
+// Single hook covering both phases
+serve.before_and_after(my_latency_hook);
+
+// Chain of before hooks
+request_hook::before()
+    .then_fn(hook_a)
+    .then_fn(hook_b)
+    .serving(serve);
+```

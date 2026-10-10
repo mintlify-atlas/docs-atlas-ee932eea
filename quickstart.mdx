@@ -1,47 +1,215 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get started with tarpc and build your first service"
+sidebarTitle: "Quickstart"
+description: "Build and run your first tarpc service end-to-end using an in-process channel, the #[tarpc::service] macro, and the Tokio async runtime."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
-
-<Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
-
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
-
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
-
-    ```bash
-    your-cli start
-    ```
-  </Step>
-</Steps>
+This guide walks you through building a minimal but fully functional tarpc service. You will define a service trait, implement the server-side handler, connect a client, and call the remote procedure — all within a single Rust binary using an in-process channel. No network configuration is required to follow along.
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
-
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+  The in-process channel used here is ideal for testing and for services that
+  run in the same process. For real-world network communication over TCP, see
+  the [example-service](https://github.com/google/tarpc/tree/master/example-service)
+  in the tarpc repository.
 </Tip>
+
+<Steps>
+
+<Step title="Add dependencies">
+
+Create a new Rust project and add the following to your `Cargo.toml`:
+
+```toml Cargo.toml
+[dependencies]
+anyhow  = "1.0"
+futures = "0.3"
+tarpc   = { version = "0.38", features = ["tokio1"] }
+tokio   = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+```
+
+The `tokio1` feature enables tarpc's Tokio runtime integration, which is required to spawn the server and client tasks.
+
+</Step>
+
+<Step title="Define the service">
+
+The `#[tarpc::service]` attribute macro transforms a trait definition into a full RPC service. Add the following to `src/main.rs`:
+
+```rust src/main.rs
+use futures::prelude::*;
+use tarpc::{
+    client, context,
+    server::{self, Channel},
+};
+
+// This is the service definition. It looks a lot like a trait definition.
+// It defines one RPC, hello, which takes one arg, name, and returns a String.
+#[tarpc::service]
+trait World {
+    /// Returns a greeting for name.
+    async fn hello(name: String) -> String;
+}
+```
+
+The macro generates:
+
+- A `World` trait that you implement to provide the server-side logic.
+- A `WorldClient` struct with an async `hello` method that sends requests to the server.
+- A `World::serve` method that converts a service implementation into a request handler.
+
+<Note>
+  Every RPC method in the trait must be `async fn`. The first argument of each
+  generated handler method is always `self`, and the second is always
+  `context::Context` — even though neither appears in the trait definition.
+</Note>
+
+</Step>
+
+<Step title="Implement the server">
+
+Create a server struct and implement the generated `World` trait on it:
+
+```rust src/main.rs
+// This is the type that implements the generated World trait. It is the
+// business logic and is used to start the server.
+#[derive(Clone)]
+struct HelloServer;
+
+impl World for HelloServer {
+    async fn hello(self, _: context::Context, name: String) -> String {
+        format!("Hello, {name}!")
+    }
+}
+```
+
+The `Clone` derive is required because tarpc clones the server value for each incoming connection (or, in this case, for the single in-process channel).
+
+The `context::Context` argument carries the request deadline and distributed-tracing metadata. Here we discard it with `_`, but in production code you can inspect it or forward it to downstream calls.
+
+</Step>
+
+<Step title="Wire up client and server">
+
+Now write the `main` function that creates an in-process transport, starts the server in a background task, and calls the service from the client:
+
+```rust src/main.rs
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Create an in-process channel. The two ends are the client transport
+    // and the server transport.
+    let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
+
+    // Wrap the server transport in a BaseChannel and execute it.
+    // server.execute returns a stream of response futures — one per request.
+    // We drive that stream by spawning each response future on Tokio.
+    let server = server::BaseChannel::with_defaults(server_transport);
+    tokio::spawn(
+        server
+            .execute(HelloServer.serve())
+            // Handle all requests concurrently.
+            .for_each(|response| async move {
+                tokio::spawn(response);
+            }),
+    );
+
+    // WorldClient is generated by the #[tarpc::service] attribute.
+    // It takes a config and any Transport as input.
+    let client = WorldClient::new(client::Config::default(), client_transport).spawn();
+
+    // The client has an RPC method for each RPC defined in the annotated trait.
+    // The first argument is always a Context, which carries the deadline and
+    // trace information useful for debugging distributed requests.
+    let hello = client
+        .hello(context::current(), "Stim".to_string())
+        .await?;
+
+    println!("{hello}");
+
+    Ok(())
+}
+```
+
+Run the example:
+
+```bash
+cargo run
+```
+
+You should see:
+
+```
+Hello, Stim!
+```
+
+</Step>
+
+</Steps>
+
+## Complete example
+
+Here is the full `src/main.rs` for easy copy-paste:
+
+```rust src/main.rs
+use futures::prelude::*;
+use tarpc::{
+    client, context,
+    server::{self, Channel},
+};
+
+#[tarpc::service]
+trait World {
+    /// Returns a greeting for name.
+    async fn hello(name: String) -> String;
+}
+
+#[derive(Clone)]
+struct HelloServer;
+
+impl World for HelloServer {
+    async fn hello(self, _: context::Context, name: String) -> String {
+        format!("Hello, {name}!")
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
+
+    let server = server::BaseChannel::with_defaults(server_transport);
+    tokio::spawn(
+        server
+            .execute(HelloServer.serve())
+            .for_each(|response| async move {
+                tokio::spawn(response);
+            }),
+    );
+
+    let client = WorldClient::new(client::Config::default(), client_transport).spawn();
+
+    let hello = client
+        .hello(context::current(), "Stim".to_string())
+        .await?;
+
+    println!("{hello}");
+
+    Ok(())
+}
+```
+
+## What's happening under the hood
+
+| Component | What it does |
+|---|---|
+| `tarpc::transport::channel::unbounded()` | Creates a pair of in-process transports (like `std::sync::mpsc`, but async) |
+| `server::BaseChannel::with_defaults` | Wraps the server transport with default settings (10 s deadline, no request limit) |
+| `HelloServer.serve()` | Converts the `HelloServer` impl into a `Serve` object that dispatches incoming requests |
+| `channel.execute(serve)` | Returns a `Stream` of futures — one per in-flight request |
+| `.for_each(handler)` | Drives all request futures concurrently by spawning them on the Tokio thread pool |
+| `WorldClient::new(...).spawn()` | Creates the generated client and starts its background driver task |
+| `context::current()` | Returns a `Context` with a 10 s deadline and the current tracing span |
+
+## Next steps
+
+- Read the [Installation](/installation) page to learn about all available Cargo feature flags.
+- Explore the [example-service](https://github.com/google/tarpc/tree/master/example-service) for a full TCP-based client and server with OpenTelemetry tracing.
+- Browse the [API documentation](https://docs.rs/tarpc) on docs.rs.

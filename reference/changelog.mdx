@@ -1,0 +1,298 @@
+---
+title: "tarpc release history and migration notes"
+sidebarTitle: "Changelog"
+description: "Full tarpc release history with breaking changes, migration guidance, and new features from 0.33 through the current 0.38 release."
+---
+
+This page summarises the tarpc release history sourced from `RELEASES.md` in the repository. Each entry describes what changed, whether the change is breaking, and how to migrate existing code. Older releases (0.32 and below) are included in condensed form for historical reference.
+
+<Accordion title="0.38.0 — current">
+
+This is the current release. The tarpc crate version is `0.38.0` and the `tarpc-plugins` crate version is `0.15.0`. The minimum supported Rust version (MSRV) is **1.85.0**.
+
+```toml filename="Cargo.toml"
+[dependencies]
+tarpc = "0.38"
+```
+
+No release notes were added to `RELEASES.md` beyond the version bump from 0.37.
+
+</Accordion>
+
+<Accordion title="0.37.0 — 2025-08-10">
+
+### Breaking Changes
+
+OpenTelemetry and related dependencies were updated to newer versions. Users of tarpc who also configure OpenTelemetry tracing must update their own dependency versions and any tracer-provider initialisation code.
+
+<Warning>
+If your application initialises an OpenTelemetry tracer provider (e.g. via `opentelemetry-otlp`), you must update to the versions now required by tarpc 0.37 or you will encounter dependency resolution conflicts.
+
+See the `example-service/` directory in the tarpc repository for an up-to-date initialisation example.
+</Warning>
+
+**Dependency versions required by 0.37:**
+
+| Crate | Version |
+|---|---|
+| `opentelemetry` | `0.32` |
+| `opentelemetry-otlp` | `0.32` |
+| `opentelemetry_sdk` | `0.32` |
+| `tracing-opentelemetry` | `0.33` |
+| `opentelemetry-semantic-conventions` | `0.32` |
+
+</Accordion>
+
+<Accordion title="0.36.0 — 2025-03-26">
+
+Fixed a potential crate version conflict with the `deranged` crate. No API changes; no migration needed.
+
+</Accordion>
+
+<Accordion title="0.35.0 — 2024-10-26">
+
+### Breaking Changes
+
+<Warning>
+This release contains multiple breaking changes to deadline types, error types, and the `Serve` trait. Read each section carefully before upgrading.
+</Warning>
+
+#### Deadline type: `SystemTime` → `Instant`
+
+`context::Context::deadline` and `Request::deadline()` now return `Instant` instead of `SystemTime`. The change preserves time monotonicity and better supports embedded devices without reliable wall clocks. During serialization the `Instant` is still converted to a relative `Duration`, so the wire format is backward-compatible.
+
+**Before:**
+```rust
+use std::time::{SystemTime, Duration};
+
+let ctx = context::current();
+let deadline: SystemTime = ctx.deadline;
+let remaining = deadline.duration_since(SystemTime::now()).unwrap_or(Duration::ZERO);
+```
+
+**After:**
+```rust
+use std::time::{Instant, Duration};
+
+let ctx = context::current();
+let deadline: Instant = ctx.deadline;
+let remaining = deadline.saturating_duration_since(Instant::now());
+```
+
+#### Error type changes
+
+- All `ChannelError` source errors are now wrapped in `Arc<E>` so that the same error can be cloned and delivered to all pending in-flight requests simultaneously.
+- `RpcError::Receive` was **renamed** to `RpcError::Transport` in 0.32; in 0.35 this was further renamed to `RpcError::Channel`. Its source error is now a `ChannelError<dyn Error + Send + Sync>`.
+- `RpcError::Send`'s source error is now the raw transport error instead of `ChannelError::Write(transport_error)`, because the extra wrapper was not adding information.
+
+**Updating match arms on `RpcError`:**
+```rust
+// Before (0.34)
+Err(RpcError::Receive(e)) => { /* channel error */ }
+
+// After (0.35)
+Err(RpcError::Channel(e)) => { /* ChannelError<dyn Error + Send + Sync> */ }
+```
+
+#### `serde_transport` rename
+
+`serde_transport::tcp::Connect` and `serde_transport::unix::Connect` were renamed to `TcpConnect` and `UnixConnect` respectively, to clarify compiler error messages.
+
+#### Request hooks moved to `RequestHook` extension trait
+
+Request hooks (`before`, `after`, `before_and_after`) were previously methods on the `Serve` trait. They are now methods on a separate `RequestHook` extension trait. Any code calling these methods must bring `RequestHook` into scope.
+
+**Before:**
+```rust
+use tarpc::server::Serve; // hooks were on Serve
+
+let hooked = my_serve.before(my_hook);
+```
+
+**After:**
+```rust
+use tarpc::server::request_hook::RequestHook; // hooks are on RequestHook
+
+let hooked = my_serve.before(my_hook);
+```
+
+### New Features
+
+- `serde_transport` now supports listening on TCP and UDS sockets provided by the caller (not just addresses).
+- Types implementing `Serve` now also implement `Stub`, enabling them to be used as client stubs in tests and composition.
+- The `#[tarpc::service]` attribute now accepts a `derive` argument: `#[tarpc::service(derive = [Clone, Hash])]` — generated `Request` and `Response` types will carry the specified derives.
+- `tarpc::Request` and `tarpc::Response` are no longer `#[non_exhaustive]`.
+
+</Accordion>
+
+<Accordion title="0.34.0 — 2023-12-29">
+
+### Breaking Changes
+
+<Warning>
+The `#[tarpc::server]` proc-macro attribute has been removed. Service implementations must use plain `async fn` directly in the trait impl block.
+</Warning>
+
+#### `#[tarpc::server]` removed
+
+Prior versions required annotating service `impl` blocks with `#[tarpc::server]` to rewrite `async fn`s into associated types. Rust's stabilised async-fn-in-traits feature makes this unnecessary.
+
+**Before:**
+```rust
+#[tarpc::server]
+impl World for HelloServer {
+    async fn hello(self, _: context::Context, name: String) -> String {
+        format!("Hello, {name}!")
+    }
+}
+```
+
+**After:**
+```rust
+impl World for HelloServer {
+    async fn hello(self, _: context::Context, name: String) -> String {
+        format!("Hello, {name}!")
+    }
+}
+```
+
+#### `Channel::execute` no longer spawns handlers
+
+`Channel::execute` now returns a `Stream<Item = impl Future<Output = ()>>` instead of spawning each handler automatically. Each future in the stream is one request handler that must be awaited or spawned by the caller.
+
+**Before:**
+```rust
+channel.execute(server.serve()).await;
+```
+
+**After:**
+```rust
+channel
+    .execute(server.serve())
+    .for_each(|rpc| async move {
+        tokio::spawn(rpc);
+    })
+    .await;
+```
+
+### New Features
+
+- **Request hooks** are now available on the `Serve` trait (later moved to the `RequestHook` extension trait in 0.35). Use `before`, `after`, and `before_and_after` to inject cross-cutting logic such as throttling or authorization without touching handler code.
+- **`Stub` trait** is introduced. The generated `Client` type and any `Serve` implementor now implement `Stub`, making it straightforward to write generic client wrappers for load balancing, retries, and so on.
+
+</Accordion>
+
+<Accordion title="0.33.0 — 2023-04-01">
+
+### Breaking Changes
+
+The OpenTelemetry dependency version was increased to **0.18**. Users instrumenting with OpenTelemetry must update their own dependencies to match.
+
+</Accordion>
+
+<Accordion title="0.32.0 — 2023-03-24">
+
+### Breaking Changes
+
+Several error types changed to return more specific transport errors in RPC results:
+
+- `client::RpcError::Disconnected` was split into three variants:
+  - `Shutdown` — the client was shut down intentionally or due to an error.
+  - `Send` — a single RPC message failed to send over the transport.
+  - `Receive` — a fatal error while receiving from the transport (all in-flight RPCs fail).
+- `client::ChannelError` and `server::ChannelError` were unified into `tarpc::ChannelError`, which now identifies which transport operation failed (read, ready, write, flush, or close).
+
+</Accordion>
+
+<Accordion title="0.31.0 — 2022-11-03">
+
+Added Unix Domain Sockets to the `serde_transport` module. Enable the `"unix"` Cargo feature to use `serde_transport::unix`. No breaking changes.
+
+</Accordion>
+
+<Accordion title="0.30.0 — 2022-08-12">
+
+### Breaking Changes
+
+Some types implementing `Future` are now annotated with `#[must_use]`. Code that created these futures without using them previously compiled without warning; it will now warn (or error if `#[deny(warnings)]` is set).
+
+### Fixes
+
+- Servers more reliably clean up request state for requests with long deadlines when response processing is aborted without sending a response.
+
+</Accordion>
+
+<Accordion title="0.29.0 — 2022-05-26">
+
+### Breaking Changes
+
+`Context.deadline` is now serialized as a `Duration` (relative to the current time) instead of an absolute `SystemTime`. This prevents clock skew between client and server from affecting deadline behaviour. The change is wire-breaking; client and server must be updated together.
+
+</Accordion>
+
+<Accordion title="0.28.0 — 2022-04-06">
+
+### Breaking Changes
+
+- The minimum supported Rust version increased to **1.58.0**.
+- The OpenTelemetry dependency version increased to **0.17.0**.
+
+</Accordion>
+
+<Accordion title="0.27.1 — 2021-09-22">
+
+### Breaking Changes
+
+RPC return types changed from `Result<Response, io::Error>` to `Result<Response, tarpc::client::RpcError>`. The new `RpcError` type has three structured variants:
+
+- Connection broken → `RpcError::Disconnected`
+- Request expired → `RpcError::DeadlineExceeded`
+- Server declined to process → `RpcError::Server(ServerError)`
+
+</Accordion>
+
+<Accordion title="0.26.0 — 2021-04-14">
+
+### New Features
+
+tarpc is now fully instrumented with [tracing](https://github.com/tokio-rs/tracing) and [OpenTelemetry](https://opentelemetry.io). Each RPC is traced through client, server, and downstream dependencies. Applications not connected to a collector can still use a standard `tracing_subscriber` to ingest log output.
+
+### Breaking Changes
+
+- `Context` no longer has `parent_span`.
+- `Context` gains a `SamplingDecision` field (`Sampled` or `Unsampled`).
+- `Context::scope` was removed; context propagation is now done via tracing task-local spans.
+- `server::Channel` gained a new associated type and `transport()` method.
+- `NewClient::spawn` no longer returns a `Result`.
+
+</Accordion>
+
+<Accordion title="0.25.0 — 2021-03-10">
+
+### Breaking Changes
+
+Major server module refactoring with renames:
+
+| Old name | New name |
+|---|---|
+| `Handler` | `Incoming` |
+| `ClientHandler` | `Requests` |
+| `ResponseHandler` | `InFlightRequest` |
+| `Channel::respond_with` | `Channel::requests` |
+
+All methods that produce responses were renamed `execute`. The `server::Server` type and `server::new` function were removed.
+
+Client RPC methods now take `&self` instead of consuming `self`. The `Client` trait was removed.
+
+Servers no longer send deadline-exceeded responses. Clients no longer send cancel messages when a deadline is exceeded.
+
+</Accordion>
+
+<Accordion title="0.20.0 — 2019-12-11">
+
+### Breaking Changes
+
+- Updated to tokio 0.2.
+- The `bincode-transport` and `json-transport` crates were deprecated and replaced by the `serde_transport` module inside the `tarpc` crate, gated by Cargo features.
+
+</Accordion>

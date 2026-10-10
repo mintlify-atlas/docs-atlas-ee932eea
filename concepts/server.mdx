@@ -1,0 +1,308 @@
+---
+sidebarTitle: "Server"
+title: "tarpc server setup: BaseChannel, Serve, and handlers"
+description: "Explore tarpc's server primitives: BaseChannel, Channel, Serve, the serve() helper, execute(), request spawning, and the spawn_incoming() shorthand."
+---
+
+A tarpc server is built from two composable pieces: a `Channel` that reads requests from a transport and routes responses back to the client, and a `Serve` implementor that contains your handler logic. The framework keeps these concerns separate so you can mix and match transports, throttling policies, and execution strategies without touching your business logic.
+
+## Server Configuration
+
+`server::Config` has a single field that governs back-pressure between request handlers and the outbound write path.
+
+<ParamField path="pending_response_buffer" type="usize" default="100">
+  The size of the in-process channel (in number of responses) between request handler tasks and the `Channel` sink. If all 100 slots are full, handler tasks will await until space is available before sending their responses. Increase this value if you observe handlers blocking on response delivery in high-throughput scenarios.
+</ParamField>
+
+```rust filename="src/server.rs"
+use tarpc::server;
+
+let config = server::Config {
+    pending_response_buffer: 200,
+};
+```
+
+`Config` also provides a convenience constructor to create a `BaseChannel` directly:
+
+```rust filename="src/server.rs"
+let channel = server::Config::default().channel(transport);
+```
+
+## BaseChannel
+
+`BaseChannel<Req, Resp, T>` is the standard implementation of the `Channel` trait. It wraps any `Transport` and manages the full request lifecycle:
+
+- Reads `ClientMessage` values off the transport (`Request` and `Cancel` variants).
+- Tracks in-flight requests with deadlines via an internal timer map.
+- Handles `Cancel` messages by aborting the corresponding request future.
+- Writes `Response` values back to the transport.
+
+Create one with defaults or with an explicit `Config`:
+
+```rust filename="src/server.rs"
+use tarpc::server::{self, BaseChannel};
+
+// Using defaults (pending_response_buffer = 100):
+let channel = BaseChannel::with_defaults(server_transport);
+
+// Using a custom config:
+let channel = BaseChannel::new(server::Config::default(), server_transport);
+```
+
+## The Channel Trait
+
+`server::Channel` is the trait implemented by `BaseChannel` and any decorator layered on top of it. The key methods you will use are:
+
+```rust filename="tarpc/src/server.rs (abridged)"
+pub trait Channel {
+    type Req;
+    type Resp;
+    type Transport;
+
+    fn config(&self) -> &Config;
+    fn in_flight_requests(&self) -> usize;
+    fn transport(&self) -> &Self::Transport;
+
+    fn max_concurrent_requests(self, limit: usize) -> /* … */;
+    fn requests(self) -> Requests<Self>;
+    fn execute<S>(self, serve: S) -> impl Stream<Item = impl Future<Output = ()>>;
+}
+```
+
+`Channel` is also a decorator — you can layer throttling wrappers like `max_concurrent_requests` on top of a `BaseChannel` before calling `execute` or `requests`.
+
+## The Serve Trait
+
+`server::Serve` defines the handler interface: given a context and a request, produce a response or a `ServerError`.
+
+```rust filename="tarpc/src/server.rs (abridged)"
+pub trait Serve {
+    type Req: RequestName;
+    type Resp;
+
+    async fn serve(
+        self,
+        ctx: context::Context,
+        req: Self::Req,
+    ) -> Result<Self::Resp, ServerError>;
+}
+```
+
+When you annotate a trait with `#[tarpc::service]`, implementing that trait and calling `.serve()` on your type gives you a `Serve` implementor (`ServeWorld<HelloServer>`, etc.). You can also use the `server::serve()` free function to wrap a closure.
+
+### Wrapping a Closure with `server::serve()`
+
+For simple handlers or tests, you don't need to define a whole struct:
+
+```rust filename="src/server.rs"
+use tarpc::server::serve;
+
+let handler = serve(|ctx: context::Context, i: i32| async move {
+    Ok(i + 1)
+});
+```
+
+## Executing Requests
+
+### `execute()` — Recommended for Most Applications
+
+`Channel::execute` is the highest-level API. It takes a `Serve` implementor, returns a `Stream` of `Future`s (one per incoming request), and handles all request routing internally. Each future, when polled to completion, sends the response back to the client.
+
+```rust filename="src/server.rs"
+use futures::prelude::*;
+use tarpc::server::{self, BaseChannel, Channel};
+
+let channel = BaseChannel::with_defaults(server_transport);
+
+// execute() returns Stream<Item = impl Future<Output = ()>>
+tokio::spawn(
+    channel
+        .execute(HelloServer.serve())
+        .for_each(|response_future| async move {
+            tokio::spawn(response_future);
+        }),
+);
+```
+
+The `for_each` + `tokio::spawn` pattern makes every request run concurrently. Remove the inner `tokio::spawn` and simply `.await` each future if you want strictly sequential processing.
+
+<Tip>
+  `execute()` calls `requests()` under the hood. If you need access to individual `InFlightRequest` values — for example, to inspect request metadata before dispatching — use `requests()` directly.
+</Tip>
+
+### `requests()` — Fine-Grained Control
+
+`Channel::requests()` returns a `Requests<C>` stream that yields `InFlightRequest` values. Each `InFlightRequest` has an `execute` method that runs the handler, respects the request deadline, and routes the response back:
+
+```rust filename="src/server.rs"
+use futures::prelude::*;
+use tarpc::server::{self, BaseChannel, Channel, serve};
+
+let mut requests = BaseChannel::with_defaults(server_transport).requests();
+
+tokio::spawn(async move {
+    while let Some(Ok(in_flight)) = requests.next().await {
+        tokio::spawn(
+            in_flight.execute(serve(|_, i: i32| async move { Ok(i + 1) }))
+        );
+    }
+});
+```
+
+An `InFlightRequest` dropped without calling `execute` automatically sends a cancellation message to clean up internal state.
+
+## Limiting Concurrency
+
+Apply `max_concurrent_requests` to cap how many requests a single channel processes at once. Requests over the limit receive an error response:
+
+```rust filename="src/server.rs"
+use tarpc::server::{self, BaseChannel, Channel};
+
+let channel = BaseChannel::with_defaults(server_transport)
+    .max_concurrent_requests(50);
+
+tokio::spawn(
+    channel
+        .execute(HelloServer.serve())
+        .for_each(|resp| async move { tokio::spawn(resp); }),
+);
+```
+
+## Handling Multiple Connections with `Incoming`
+
+In real applications your server accepts many connections. The `server::incoming::Incoming` extension trait adds helpers to any `Stream<Item = Channel>`:
+
+```rust filename="tarpc/src/server/incoming.rs (abridged)"
+pub trait Incoming<C: Channel>: Stream<Item = C> + Sized {
+    fn max_channels_per_key<K, KF>(self, n: u32, keymaker: KF) -> /* … */;
+    fn max_concurrent_requests_per_channel(self, n: usize) -> /* … */;
+    fn execute<S>(self, serve: S)
+        -> impl Stream<Item = impl Stream<Item = impl Future<Output = ()>>>;
+}
+```
+
+### `spawn_incoming()` Shorthand
+
+When using the `tokio1` feature, `spawn_incoming` fully automates spawning: it spawns each channel as a task and each request within that channel as its own task:
+
+```rust filename="src/server.rs"
+use futures::{prelude::*, stream};
+use tarpc::{
+    client::{self, NewClient},
+    server::{self, BaseChannel, incoming::{Incoming, spawn_incoming}, serve},
+    transport,
+};
+
+#[tokio::main]
+async fn main() {
+    let (tx, rx) = transport::channel::unbounded();
+    let NewClient { client, dispatch } = client::new(client::Config::default(), tx);
+    tokio::spawn(dispatch);
+
+    let incoming = stream::once(async move {
+        BaseChannel::new(server::Config::default(), rx)
+    })
+    .execute(serve(|_, i: i32| async move { Ok(i + 1) }));
+
+    tokio::spawn(spawn_incoming(incoming));
+
+    let result = client.call(context::current(), 1).await.unwrap();
+    assert_eq!(result, 2);
+}
+```
+
+## Patterns Side by Side
+
+<Tabs>
+  <Tab title="execute() + for_each">
+    Best for straightforward servers where all requests are handled identically.
+
+    ```rust filename="src/server.rs"
+    use futures::prelude::*;
+    use tarpc::server::{self, BaseChannel, Channel};
+
+    let channel = BaseChannel::with_defaults(server_transport);
+    tokio::spawn(
+        channel
+            .execute(HelloServer.serve())
+            .for_each(|resp| async move {
+                tokio::spawn(resp);
+            }),
+    );
+    ```
+  </Tab>
+  <Tab title="requests() loop">
+    Best when you need access to individual request metadata or custom dispatch logic.
+
+    ```rust filename="src/server.rs"
+    use futures::prelude::*;
+    use tarpc::server::{self, BaseChannel, Channel, serve};
+
+    let mut requests = BaseChannel::with_defaults(server_transport).requests();
+    tokio::spawn(async move {
+        while let Some(Ok(req)) = requests.next().await {
+            tokio::spawn(req.execute(HelloServer.serve()));
+        }
+    });
+    ```
+  </Tab>
+  <Tab title="spawn_incoming()">
+    Best for multi-connection servers where each connection is a stream item.
+
+    ```rust filename="src/server.rs"
+    use futures::{prelude::*, stream};
+    use tarpc::server::{self, BaseChannel, incoming::{Incoming, spawn_incoming}, serve};
+
+    let incoming = stream::iter(vec![server_transport])
+        .map(BaseChannel::with_defaults)
+        .execute(HelloServer.serve());
+
+    tokio::spawn(spawn_incoming(incoming));
+    ```
+  </Tab>
+</Tabs>
+
+## Complete Server Example
+
+```rust filename="examples/server.rs"
+use futures::prelude::*;
+use tarpc::{
+    client, context,
+    server::{self, Channel},
+};
+
+#[tarpc::service]
+pub trait World {
+    async fn hello(name: String) -> String;
+}
+
+#[derive(Clone)]
+struct HelloServer;
+
+impl World for HelloServer {
+    async fn hello(self, _ctx: context::Context, name: String) -> String {
+        format!("Hello, {name}!")
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let (client_transport, server_transport) =
+        tarpc::transport::channel::unbounded();
+
+    // Start the server.
+    let server = server::BaseChannel::with_defaults(server_transport);
+    tokio::spawn(
+        server
+            .execute(HelloServer.serve())
+            .for_each(|resp| async move { tokio::spawn(resp); }),
+    );
+
+    // Connect a client and call the service.
+    let client = WorldClient::new(client::Config::default(), client_transport).spawn();
+    let greeting = client.hello(context::current(), "Stim".to_string()).await?;
+    println!("{greeting}");
+
+    Ok(())
+}
+```

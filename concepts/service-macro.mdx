@@ -1,0 +1,197 @@
+---
+sidebarTitle: "Service Macro"
+title: "Defining services with the #[tarpc::service] macro"
+description: "Learn how #[tarpc::service] generates service traits, client stubs, request/response enums, and handler scaffolding from a single annotated trait."
+---
+
+The `#[tarpc::service]` attribute macro is the cornerstone of every tarpc application. You annotate a Rust trait with it, and tarpc generates everything you need to implement and consume that service: the service trait itself, typed request and response enums, a client stub, and the glue code that ties them together. There is no separate schema language and no separate code-generation step — the macro runs as part of the normal Rust compilation process.
+
+## Defining a Service
+
+A service definition looks almost identical to a regular Rust trait. Each RPC is declared as an `async fn` that takes named arguments and returns a value. The `self` receiver and the `context::Context` argument are _not_ written in the definition; the macro adds them for you in the generated trait.
+
+```rust filename="src/lib.rs"
+use tarpc::context;
+
+#[tarpc::service]
+pub trait World {
+    /// Returns a greeting for the given name.
+    async fn hello(name: String) -> String;
+}
+```
+
+<Note>
+  Method names `new` and `serve` are reserved — the macro uses them for generated items and will produce a compile error if you try to use either as an RPC name.
+</Note>
+
+## What the Macro Generates
+
+Applying `#[tarpc::service]` to the `World` trait above expands to the following items in the surrounding module:
+
+<Accordion title="Generated items at a glance">
+
+| Item | Kind | Description |
+|------|------|-------------|
+| `World` | `trait` | The service trait. Implementors provide the request handlers. Each `async fn` gains `self` and a `context::Context` as its first two arguments. |
+| `World::serve` | method | Turns a service implementor into a `ServeWorld<S>` handler value for use with `InFlightRequest::execute`. |
+| `ServeWorld<S>` | `struct` | The handler wrapper returned by `.serve()`. Implements the `server::Serve` trait. |
+| `WorldClient<Stub>` | `struct` | The client stub. Derives `Clone` and `Debug`. Defaults `Stub` to `client::Channel<WorldRequest, WorldResponse>`. |
+| `WorldClient::new` | `fn` | Constructs a `NewClient<WorldClient, RequestDispatch<…>>` from a `client::Config` and any compatible `Transport`. |
+| `WorldStub` | `trait` | A marker trait for any `Stub` whose `Req`/`Resp` types match `WorldRequest`/`WorldResponse`. |
+| `WorldRequest` | `enum` | One variant per RPC, named in `CamelCase` after the method. Carries the method arguments as struct fields. |
+| `WorldResponse` | `enum` | One variant per RPC, wrapping that RPC's return type. |
+
+</Accordion>
+
+### The Service Trait
+
+The generated `World` trait has one `async fn` per RPC. Each method receives `self` by value, a `context::Context` as the first explicit argument, and then the declared parameters:
+
+```rust filename="src/server.rs"
+// Generated (conceptually):
+pub trait World: Sized {
+    async fn hello(self, context: tarpc::context::Context, name: String) -> String;
+
+    fn serve(self) -> ServeWorld<Self> {
+        ServeWorld { service: self }
+    }
+}
+```
+
+You implement this trait on your server type:
+
+```rust filename="src/server.rs"
+use tarpc::context;
+
+#[derive(Clone)]
+struct HelloServer;
+
+impl World for HelloServer {
+    async fn hello(self, _ctx: context::Context, name: String) -> String {
+        format!("Hello, {name}!")
+    }
+}
+```
+
+<Tip>
+  Your server type must implement `Clone` because tarpc clones the handler once per in-flight request so each request gets an independent, owned copy of the service state.
+</Tip>
+
+### Client Naming Convention
+
+The generated client struct is always named `<ServiceName>Client`. A service trait called `World` produces `WorldClient`. A service called `Calculator` produces `CalculatorClient`.
+
+```rust filename="src/main.rs"
+// WorldClient is generated from `trait World { … }`
+let client = WorldClient::new(client::Config::default(), transport).spawn();
+let greeting = client.hello(context::current(), "Alice".to_string()).await?;
+```
+
+Each client method mirrors its RPC definition: it takes `&self`, then a `context::Context`, then the declared arguments, and returns a `Future<Output = Result<ReturnType, RpcError>>`.
+
+### Request and Response Enums
+
+The macro generates `WorldRequest` and `WorldResponse` enums. RPC method names are converted from `snake_case` to `CamelCase` for the variant names:
+
+```rust filename="generated (illustrative)"
+// For: async fn get_user_name(id: u64) -> String;
+pub enum WorldRequest {
+    GetUserName { id: u64 },
+}
+
+pub enum WorldResponse {
+    GetUserName(String),
+}
+```
+
+You rarely interact with these types directly, but they are useful when writing test harnesses or custom stubs.
+
+## Adding Derive Attributes
+
+Use the `derive` argument to add `#[derive(…)]` to the generated `Request` and `Response` enums. This is the primary way to enable serde serialization required by network transports:
+
+```rust filename="src/lib.rs"
+use serde::{Deserialize, Serialize};
+
+#[tarpc::service(derive = [Serialize, Deserialize])]
+pub trait World {
+    async fn hello(name: String) -> String;
+}
+```
+
+When the `serde1` Cargo feature is enabled and no `derive` argument is given, tarpc automatically derives `Serialize` and `Deserialize` on the enums. You can explicitly opt out:
+
+```rust filename="src/lib.rs"
+// Disable auto-serde even with the serde1 feature active.
+#[tarpc::service(derive = [])]
+pub trait World {
+    async fn hello(name: String) -> String;
+}
+```
+
+<Note>
+  The older `derive_serde = true` form is deprecated. Prefer `derive = [Serialize, Deserialize]`.
+</Note>
+
+## Visibility and Attributes
+
+The visibility applied to the trait definition propagates to all generated items. A `pub trait` produces a `pub WorldClient`, `pub WorldRequest`, and so on. A `pub(crate) trait` scopes everything to the crate.
+
+Doc comments placed on individual RPC methods are forwarded to both the generated service trait method and the corresponding client method:
+
+```rust filename="src/lib.rs"
+#[tarpc::service]
+pub trait FileStore {
+    /// Reads `len` bytes starting at `offset` from `path`.
+    ///
+    /// Returns an error if the file does not exist or the range is out of bounds.
+    async fn read(path: String, offset: u64, len: usize) -> Vec<u8>;
+}
+```
+
+Running `cargo doc` on your crate will include these comments in the generated documentation for both the server-side trait and the client-side stub method.
+
+## Full Example
+
+The following is a complete, self-contained example using an in-process channel:
+
+```rust filename="examples/hello.rs"
+use futures::prelude::*;
+use tarpc::{
+    client, context,
+    server::{self, Channel},
+};
+
+#[tarpc::service]
+pub trait World {
+    /// Returns a greeting for name.
+    async fn hello(name: String) -> String;
+}
+
+#[derive(Clone)]
+struct HelloServer;
+
+impl World for HelloServer {
+    async fn hello(self, _ctx: context::Context, name: String) -> String {
+        format!("Hello, {name}!")
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
+
+    let server = server::BaseChannel::with_defaults(server_transport);
+    tokio::spawn(
+        server
+            .execute(HelloServer.serve())
+            .for_each(|response| async move { tokio::spawn(response); }),
+    );
+
+    let client = WorldClient::new(client::Config::default(), client_transport).spawn();
+    let hello = client.hello(context::current(), "Stim".to_string()).await?;
+    println!("{hello}");
+
+    Ok(())
+}
+```
