@@ -55,8 +55,8 @@ The `serde-transport` Cargo feature unlocks `tarpc::serde_transport`, a generic 
 
 ```toml filename="Cargo.toml"
 [dependencies]
-tarpc = { version = "0.37", features = ["serde-transport", "tokio1"] }
-tokio-serde = { version = "0.9", features = ["json"] }  # or "bincode"
+# serde-transport-json (or serde-transport-bincode) brings in serde-transport and the codec:
+tarpc = { version = "0.37", features = ["serde-transport-json", "tokio1"] }
 ```
 
 The `serde_transport::Transport<S, Item, SinkItem, Codec>` type wraps:
@@ -69,7 +69,7 @@ The `serde_transport::Transport<S, Item, SinkItem, Codec>` type wraps:
 The `tcp` feature adds `serde_transport::tcp`:
 
 ```toml filename="Cargo.toml"
-tarpc = { version = "0.37", features = ["serde-transport", "tcp", "tokio1"] }
+tarpc = { version = "0.37", features = ["serde-transport-json", "tcp", "tokio1"] }
 ```
 
 **Server side** — listen for connections:
@@ -79,8 +79,8 @@ use futures::prelude::*;
 use tarpc::{
     server::{self, BaseChannel, Channel, incoming::Incoming},
     serde_transport::tcp,
+    tokio_serde::formats::Json,
 };
-use tokio_serde::formats::Json;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -104,8 +104,7 @@ async fn main() -> anyhow::Result<()> {
 **Client side** — connect to the server:
 
 ```rust filename="src/client.rs"
-use tarpc::{client, context, serde_transport::tcp};
-use tokio_serde::formats::Json;
+use tarpc::{client, context, serde_transport::tcp, tokio_serde::formats::Json};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -128,19 +127,17 @@ async fn main() -> anyhow::Result<()> {
 The `unix` feature (Unix platforms only) adds `serde_transport::unix`:
 
 ```toml filename="Cargo.toml"
-tarpc = { version = "0.37", features = ["serde-transport", "unix", "tokio1"] }
+tarpc = { version = "0.37", features = ["serde-transport-json", "unix", "tokio1"] }
 ```
 
 ```rust filename="src/server.rs"
-use tarpc::serde_transport::unix;
-use tokio_serde::formats::Json;
+use tarpc::{serde_transport::unix, tokio_serde::formats::Json};
 
 let mut listener = unix::listen("/tmp/my_service.sock", Json::default).await?;
 ```
 
 ```rust filename="src/client.rs"
-use tarpc::serde_transport::unix;
-use tokio_serde::formats::Json;
+use tarpc::{serde_transport::unix, tokio_serde::formats::Json};
 
 let transport = unix::connect("/tmp/my_service.sock", Json::default).await?;
 ```
@@ -151,18 +148,17 @@ let transport = unix::connect("/tmp/my_service.sock", Json::default).await?;
 
 `serde_transport` is codec-agnostic: any `tokio_serde::Serializer + Deserializer` pair works. The most common choices are:
 
-| Codec | Crate feature | Notes |
-|-------|---------------|-------|
-| `SymmetricalJson` | `tokio-serde/json` | Human-readable, easy to debug with `tcpdump`. Larger on the wire. |
-| `SymmetricalBincode` | `tokio-serde/bincode` | Compact binary format; faster than JSON for numeric-heavy payloads. |
-| `SymmetricalMessagePack` | `tokio-serde/messagepack` | Alternative compact binary format. |
-| `SymmetricalCbor` | `tokio-serde/cbor` | IETF-standard binary JSON superset. |
+| Codec type | tarpc feature | Notes |
+|------------|---------------|-------|
+| `Json` | `serde-transport-json` | Human-readable, easy to debug with `tcpdump`. Larger on the wire. Also pulls in `tokio-serde/json`. |
+| `Bincode` | `serde-transport-bincode` | Compact binary format; faster than JSON for numeric-heavy payloads. Also pulls in `tokio-serde/bincode`. |
 
 Pass the codec as a closure (not a value) so each accepted connection gets its own instance:
 
 ```rust filename="src/server.rs"
 // Json::default is a zero-argument function pointer; it matches Fn() -> Codec.
-tcp::listen("0.0.0.0:0", tokio_serde::formats::Json::default).await?;
+// tokio_serde is re-exported by tarpc when the serde-transport feature is active.
+tcp::listen("0.0.0.0:0", tarpc::tokio_serde::formats::Json::default).await?;
 ```
 
 ## Choosing a Transport
@@ -186,14 +182,14 @@ tcp::listen("0.0.0.0:0", tokio_serde::formats::Json::default).await?;
 
     **Key properties:**
     - Works across machines and processes.
-    - Requires the `serde-transport` + `tcp` features and a `Serialize + Deserialize` codec.
+    - Requires the `serde-transport-json` (or `serde-transport-bincode`) and `tcp` features.
     - Reliable, ordered delivery (TCP guarantees).
     - `tcp::Incoming` implements `Stream<Item = io::Result<Transport<TcpStream, …>>>` and integrates directly with `Incoming::execute`.
 
     ```rust filename="src/server.rs"
     let listener = tarpc::serde_transport::tcp::listen(
         "0.0.0.0:9000",
-        tokio_serde::formats::Bincode::default,
+        tarpc::tokio_serde::formats::Bincode::default,
     ).await?;
     ```
   </Tab>
@@ -203,13 +199,13 @@ tcp::listen("0.0.0.0:0", tokio_serde::formats::Json::default).await?;
     **Key properties:**
     - Lower latency than TCP on the same machine (no TCP/IP stack traversal).
     - Unix-only (Linux, macOS).
-    - Requires the `serde-transport` + `unix` features.
+    - Requires the `serde-transport-json` (or `serde-transport-bincode`) and `unix` features.
     - Use `TempPathBuf::with_random` for ephemeral test sockets.
 
     ```rust filename="src/server.rs"
     let listener = tarpc::serde_transport::unix::listen(
         "/run/my_service.sock",
-        tokio_serde::formats::Json::default,
+        tarpc::tokio_serde::formats::Json::default,
     ).await?;
     ```
   </Tab>

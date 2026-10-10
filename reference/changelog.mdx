@@ -1,7 +1,7 @@
 ---
-title: "tarpc release history and migration notes"
+title: "tarpc Release History, Breaking Changes, and Migrations"
 sidebarTitle: "Changelog"
-description: "Full tarpc release history with breaking changes, migration guidance, and new features from 0.33 through the current 0.38 release."
+description: "tarpc release history with breaking changes and migration notes from 0.20 to 0.38, covering deadline type changes, error renames, and macro updates."
 ---
 
 This page summarises the tarpc release history sourced from `RELEASES.md` in the repository. Each entry describes what changed, whether the change is breaking, and how to migrate existing code. Older releases (0.32 and below) are included in condensed form for historical reference.
@@ -82,12 +82,12 @@ let remaining = deadline.saturating_duration_since(Instant::now());
 #### Error type changes
 
 - All `ChannelError` source errors are now wrapped in `Arc<E>` so that the same error can be cloned and delivered to all pending in-flight requests simultaneously.
-- `RpcError::Receive` was **renamed** to `RpcError::Transport` in 0.32; in 0.35 this was further renamed to `RpcError::Channel`. Its source error is now a `ChannelError<dyn Error + Send + Sync>`.
-- `RpcError::Send`'s source error is now the raw transport error instead of `ChannelError::Write(transport_error)`, because the extra wrapper was not adding information.
+- `RpcError::Receive` (introduced in 0.32) was **renamed** to `RpcError::Channel`. Its source error is now a `ChannelError<dyn Error + Send + Sync>`, identifying which transport operation failed.
+- `RpcError::Send`'s source error is now the raw transport error directly, instead of `ChannelError::Write(transport_error)` — the extra wrapper was not adding information.
 
 **Updating match arms on `RpcError`:**
 ```rust
-// Before (0.34)
+// Before (0.34 and earlier)
 Err(RpcError::Receive(e)) => { /* channel error */ }
 
 // After (0.35)

@@ -12,9 +12,10 @@ The TCP transport lives behind two optional feature flags. Add them to your `Car
 
 ```toml filename="Cargo.toml"
 [dependencies]
-tarpc = { version = "0.38", features = ["serde-transport", "tcp"] }
+# Use serde-transport-json or serde-transport-bincode for the built-in codecs,
+# or use serde-transport + tcp and bring your own tokio-serde format.
+tarpc = { version = "0.38", features = ["serde-transport-json", "tcp"] }
 tokio = { version = "1", features = ["full"] }
-tokio-serde = { version = "0.9", features = ["json"] }   # or "bincode"
 ```
 
 | Feature | Enables |

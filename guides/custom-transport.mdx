@@ -233,7 +233,7 @@ Both sides call `add_compression(transport)` with the plain TCP transport; every
 
 ```bash
 # Unix-socket custom transport
-cargo run --example custom_transport --features "serde-transport"
+cargo run --example custom_transport --features "serde1,tokio1,serde-transport"
 
 # Deflate-compressed TCP transport
 cargo run --example compression --features "serde-transport,tcp"

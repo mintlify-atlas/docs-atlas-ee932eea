@@ -1,7 +1,7 @@
 ---
-title: "Error types and error handling in tarpc"
+title: "tarpc Error Types: RpcError, ChannelError, ServerError"
 sidebarTitle: "Error Types"
-description: "Reference for all public tarpc error types — ServerError, ChannelError, and RpcError — with variants, fields, and idiomatic handling patterns."
+description: "Reference for all public tarpc error types — RpcError, ChannelError, and ServerError — with every variant, field, and idiomatic handling patterns."
 ---
 
 tarpc uses a small hierarchy of structured error types that map cleanly onto the three layers of an RPC call: the server handler, the transport channel, and the client-visible result. Understanding where each error originates and how it travels through the system makes it straightforward to write handlers that distinguish recoverable from fatal conditions.

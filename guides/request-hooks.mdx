@@ -49,7 +49,7 @@ Implement `BeforeRequest` on your own type when you need state:
 
 ```rust filename="src/hooks.rs"
 use tarpc::{context, ServerError, server::request_hook::BeforeRequest};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 
 /// Caps the deadline on every incoming request.
 #[derive(Clone)]
@@ -61,7 +61,7 @@ impl<Req> BeforeRequest<Req> for MaxDeadline {
         ctx: &mut context::Context,
         _req: &Req,
     ) -> Result<(), ServerError> {
-        let max = SystemTime::now() + self.0;
+        let max = Instant::now() + self.0;
         if ctx.deadline > max {
             ctx.deadline = max;
         }
@@ -162,7 +162,7 @@ let handler = request_hook::before()
     })
     .then_fn(move |ctx: &mut tarpc::context::Context, _req| async move {
         // second hook — cap the deadline
-        let max = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        let max = std::time::Instant::now() + std::time::Duration::from_secs(10);
         if ctx.deadline > max {
             ctx.deadline = max;
         }

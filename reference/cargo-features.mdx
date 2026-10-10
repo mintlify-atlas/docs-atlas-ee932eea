@@ -1,10 +1,10 @@
 ---
-title: "tarpc Cargo feature flags reference"
+title: "tarpc Cargo Feature Flags: Complete Reference Guide"
 sidebarTitle: "Cargo Features"
-description: "Complete reference for all tarpc Cargo feature flags, their dependencies, and common combinations for network transports and serialization."
+description: "Complete reference for all tarpc Cargo feature flags, their dependency trees, and recommended feature combinations for TCP, Unix, and custom transports."
 ---
 
-tarpc ships with a minimal default feature set — the core request/response machinery compiles with no optional dependencies. Every additional capability (Serde serialization, Tokio integration, TCP/Unix transports) is opt-in through Cargo feature flags. This page describes every feature declared in `tarpc/Cargo.toml`, its exact dependency tree, and the scenarios where you'd reach for each one.
+tarpc ships with **no default features** (`default = []`). The core request/response machinery compiles with no optional dependencies. Every additional capability — Serde serialization, Tokio integration, TCP/Unix transports — is opt-in through Cargo feature flags. This page describes every feature declared in `tarpc/Cargo.toml`, its exact dependency tree, and the scenarios where you'd reach for each one.
 
 ## Feature Overview
 

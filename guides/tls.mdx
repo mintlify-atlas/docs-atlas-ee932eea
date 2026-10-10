@@ -12,12 +12,12 @@ Add the following to your `Cargo.toml`. No special tarpc features are required b
 
 ```toml filename="Cargo.toml"
 [dependencies]
-tarpc = { version = "0.38", features = ["serde-transport", "tcp"] }
+# serde-transport-bincode activates serde-transport + the bincode tokio-serde format.
+# tarpc re-exports tokio_serde and tokio_util, so no separate deps are needed.
+tarpc = { version = "0.38", features = ["serde-transport-bincode"] }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2.2"
-tokio-serde = { version = "0.9", features = ["bincode"] }
-tokio-util = { version = "0.7", features = ["codec"] }
 anyhow = "1"
 ```
 
@@ -65,7 +65,10 @@ pub fn load_private_key(key: &str) -> rustls::pki_types::PrivateKeyDer<'_> {
 
     ```rust filename="src/server.rs"
     use std::sync::Arc;
-    use tokio_rustls::rustls::{self, RootCertStore, server::WebPkiClientVerifier};
+    use tokio_rustls::rustls::{
+        self, RootCertStore,
+        server::{WebPkiClientVerifier, danger::ClientCertVerifier},
+    };
     use tokio_rustls::TlsAcceptor;
 
     // Server certificate and key
@@ -77,14 +80,15 @@ pub fn load_private_key(key: &str) -> rustls::pki_types::PrivateKeyDer<'_> {
     for root in load_certs(CLIENT_CHAIN_CLIENT_AUTH) {
         client_auth_roots.add(root).unwrap();
     }
-    let client_auth = WebPkiClientVerifier::builder(client_auth_roots.into())
-        .build()
-        .map_err(std::io::Error::other)
-        .unwrap();
+    let client_auth: Arc<dyn ClientCertVerifier> =
+        WebPkiClientVerifier::builder(client_auth_roots.into())
+            .build()
+            .map_err(std::io::Error::other)
+            .unwrap();
     // Use .with_no_client_auth() instead if you don't want mutual TLS.
 
     let config = rustls::ServerConfig::builder()
-        .with_client_cert_verifier(Arc::from(client_auth))
+        .with_client_cert_verifier(client_auth)
         .with_single_cert(cert, key)
         .unwrap();
     let acceptor = TlsAcceptor::from(Arc::new(config));

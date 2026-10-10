@@ -27,7 +27,7 @@ anyhow = "1"
 
 ## Initializing the tracing subscriber
 
-The `init_tracing` pattern, used in both the `example-service` crate and the `tracing` example, wires together three layers:
+The `init_tracing` pattern, used in the `example-service` crate and variations of it in the `tracing` example, wires together three layers:
 
 1. An `EnvFilter` that reads log levels from `RUST_LOG`
 2. A `fmt` layer for human-readable console output
@@ -147,7 +147,7 @@ for _ in 1..=5 {
 
 Each `double_client.double(ctx, 1)` call produces a trace that looks like:
 
-```
+```text
 double (client) ──► double (server) ──► add (client) ──► add (server)
 ```
 

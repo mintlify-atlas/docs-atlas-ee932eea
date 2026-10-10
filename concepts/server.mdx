@@ -189,6 +189,7 @@ When using the `tokio1` feature, `spawn_incoming` fully automates spawning: it s
 use futures::{prelude::*, stream};
 use tarpc::{
     client::{self, NewClient},
+    context,
     server::{self, BaseChannel, incoming::{Incoming, spawn_incoming}, serve},
     transport,
 };
